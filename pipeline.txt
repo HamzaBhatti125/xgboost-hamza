@@ -1,0 +1,331 @@
+################################################################################
+ON-CHAIN DEX SIGNAL GENERATION - FULL PIPELINE
+################################################################################
+
+Started at: 2026-01-23 17:31:08
+
+================================================================================
+📋 PRE-FLIGHT CHECK
+================================================================================
+
+  ❌ Pair universe
+  ✅ Candles data
+
+⚠️  WARNING: Some data files are missing!
+   Expected paths:
+   - /home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe
+   - /home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet
+
+   Please verify dataset locations and update paths in Config if needed.
+
+   Continue anyway? (y/n): y
+
+================================================================================
+🚀 STEP 1: Data Preparation (Loading, Filtering, Labeling)
+================================================================================
+Command: python onchain_signal_system.py
+
+
+################################################################################
+ON-CHAIN DEX TRADING SIGNAL GENERATION SYSTEM
+################################################################################
+
+Target Chain: Base (chain_id = 8453)
+Philosophy: Trade rarely, survive always, compound slowly
+################################################################################
+
+
+================================================================================
+STEP 1: LOADING PAIR UNIVERSE DATA
+================================================================================
+✓ Loaded pair universe (lazy mode)
+
+Filtering for Base chain (chain_id = 8453)
+  Total pairs across all chains: 387,449
+  Base chain pairs: 99,290 (25.6%)
+
+================================================================================
+STEP 2: APPLYING QUALITY FILTERS
+================================================================================
+
+🚫 Hard Exclusions:
+  Available columns: 37 total
+  • flag_inactive: ALL 0 pairs flagged inactive - SKIPPING this filter (would remove all pairs)
+  • flag_blacklisted: ALL 0 pairs blacklisted - SKIPPING (would remove all pairs)
+  • flag_unsupported_quote: ALL pairs unsupported - SKIPPING (would remove all pairs)
+  • flag_unknown_exchange: ALL pairs unknown exchange - SKIPPING (would remove all pairs)
+  • sell_tax: ALL pairs have sell_tax > 10.0% - SKIPPING (would remove all pairs)
+  • buy_tax: ALL pairs have buy_tax > 10.0% - SKIPPING (would remove all pairs)
+  • transfer_tax: ALL pairs have transfer_tax > 10.0% - SKIPPING (would remove all pairs)
+
+💧 Liquidity & Survival Filters:
+  • min_age: Would remove all 99,290 pairs - SKIPPING
+  • recent_activity: Would remove all 99,290 pairs - SKIPPING
+  • min_volume: removed 97,538 pairs (98.2%)
+  • min_trades: removed 1,682 pairs (1.7%)
+
+==================================================
+FILTERING SUMMARY:
+  Initial pairs: 99,290
+  Removed: 99,220 (99.9%)
+  Remaining: 70 (0.1%)
+==================================================
+
+✓ Filtered to 70 high-quality Base chain pairs
+
+================================================================================
+STEP 3: LOADING CANDLE DATA
+================================================================================
+Loading candles for 70 pairs in chunks of 5,000...
+✓ Loaded 28,357 candle records
+  Date range: 2023-08-08 00:00:00 to 2025-12-17 00:00:00
+  Unique pairs: 70
+
+================================================================================
+STEP 4: FEATURE ENGINEERING
+================================================================================
+
+Creating features:
+  📈 Price & Trend:
+     • 1d, 3d, 7d returns
+     • EMA(7) vs EMA(21) cross
+     • High-low range normalized
+  💹 Flow & Liquidity:
+     • Buy/Sell volume ratio
+     • Volume Z-score (rolling)
+     • Trade count acceleration
+  📊 Volatility Regime:
+     • Rolling volatility (7d, 14d)
+     • Volatility contraction/expansion
+
+✓ Created 18 features
+
+================================================================================
+STEP 5: BARRIER-BASED LABELING
+================================================================================
+
+Label configuration:
+  Target upside: +8.0%
+  Stop loss: -3.0%
+  Horizon: 7 days
+  Logic: Upside must be hit BEFORE downside
+
+📊 Label Statistics:
+  Total samples: 28,357
+  Positive signals (BUY): 5,555 (19.59%)
+  Negative samples (HOLD): 22,802 (80.41%)
+
+⚠️  WARNING: Signal rate (19.59%) exceeds 5.0% threshold
+     Consider more aggressive labeling parameters.
+
+✓ Final dataset: 26,887 samples across 70 pairs
+
+✓ Saved processed data to: /home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet
+
+================================================================================
+✅ DATA PREPARATION COMPLETE
+================================================================================
+
+
+
+✅ Completed in 0.9s
+
+✅ Processed data created: /home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet
+   Size: 6.19 MB
+
+================================================================================
+🚀 STEP 2: Model Training, Backtesting & Validation
+================================================================================
+Command: python model_training.py
+
+
+################################################################################
+MODEL TRAINING, BACKTESTING & VALIDATION
+################################################################################
+
+
+================================================================================
+STEP 6: DATA LOADING & SPLITTING
+================================================================================
+
+✓ Loaded 26,887 samples
+  Date range: 2023-08-22 00:00:00 to 2025-12-10 00:00:00
+  Pairs: 70
+
+📊 Time-based split:
+  Train: 2,578 samples (2023-08-22 00:00:00 to 2024-06-30 00:00:00)
+  Val:   2,616 samples (2024-07-01 00:00:00 to 2024-09-30 00:00:00)
+  Test:  21,693 samples (2024-10-01 00:00:00 to 2025-12-10 00:00:00)
+  Train positive rate: 18.50%
+  Val positive rate: 19.11%
+  Test positive rate: 19.94%
+
+================================================================================
+STEP 7: MODEL TRAINING
+================================================================================
+
+🎯 Model Choice: XGBoost Gradient Boosting
+
+Justification:
+  • Handles class imbalance naturally via scale_pos_weight
+  • Robust to outliers and noisy on-chain data
+  • Fast training with histogram-based splits
+  • Built-in regularization prevents overfitting
+  • Interpretable via feature importance
+
+⚖️  Class balance:
+  Negative samples: 2,101
+  Positive samples: 477
+  Scale pos weight: 4.40
+
+🏋️  Training XGBoost...
+  Max rounds: 500
+  Early stopping: 50 rounds
+[0]     train-auc:0.68656       val-auc:0.50573
+[50]    train-auc:0.81965       val-auc:0.52959
+[59]    train-auc:0.83690       val-auc:0.53089
+
+✓ Training complete. Best iteration: 9
+
+📊 Top 5 Features (by gain):
+  • volatility_7d: 37.7
+  • volatility_14d: 34.2
+  • return_7d: 25.1
+  • vol_regime_change: 24.2
+  • ema_cross_signal: 23.6
+
+================================================================================
+MODEL EVALUATION: VALIDATION
+================================================================================
+
+🎯 Performance at different thresholds:
+  Threshold 0.5: Precision=0.189, Recall=0.318, F1=0.237, Signal Rate=32.22%
+  Threshold 0.6: Precision=0.114, Recall=0.048, F1=0.068, Signal Rate=8.03%
+  Threshold 0.7: Precision=0.025, Recall=0.002, F1=0.004, Signal Rate=1.53%
+  Threshold 0.8: Precision=0.000, Recall=0.000, F1=0.000, Signal Rate=0.08%
+  Threshold 0.9: Precision=0.000, Recall=0.000, F1=0.000, Signal Rate=0.00%
+
+✓ Best threshold: 0.7 (Precision: 0.025)
+  ROC AUC: 0.531
+
+================================================================================
+MODEL EVALUATION: TEST
+================================================================================
+
+🎯 Performance at different thresholds:
+  Threshold 0.5: Precision=0.201, Recall=0.374, F1=0.262, Signal Rate=37.14%
+  Threshold 0.6: Precision=0.204, Recall=0.097, F1=0.131, Signal Rate=9.44%
+  Threshold 0.7: Precision=0.187, Recall=0.012, F1=0.023, Signal Rate=1.30%
+  Threshold 0.8: Precision=0.256, Recall=0.002, F1=0.005, Signal Rate=0.18%
+  Threshold 0.9: Precision=0.000, Recall=0.000, F1=0.000, Signal Rate=0.00%
+
+✓ Best threshold: 0.8 (Precision: 0.256)
+  ROC AUC: 0.503
+
+================================================================================
+STEP 8: BACKTESTING - TEST
+================================================================================
+
+📋 Backtesting Rules:
+  • Entry: Next day open (T+1)
+  • Exit: Max 7 days
+  • Fees: 0.3%
+  • Slippage: 0.2%
+  • Total friction: 0.5%
+  • No overlapping positions per pair
+
+==================================================
+BACKTEST RESULTS: TEST
+==================================================
+  Total trades: 21
+  Total return: 136.33%
+  Avg return per trade: 6.49%
+  Sharpe ratio: 4.11
+  Max drawdown: 13.67%
+  Win rate: 57.1%
+  Avg days held: 7.0
+
+✅ STRATEGY IS PROFITABLE
+   Sharpe (4.11) >= 1.0
+   Max DD (13.67%) <= 25.0%
+
+================================================================================
+STEP 9: ROBUSTNESS CHECKS
+================================================================================
+
+📅 Performance by Quarter:
+  Q4 2024: Signal rate=0.03%, True positive rate=25.72%
+  Q1 2025: Signal rate=0.08%, True positive rate=13.51%
+  Q4 2025: Signal rate=0.14%, True positive rate=14.43%
+  Q3 2025: Signal rate=0.44%, True positive rate=23.97%
+  Q2 2025: Signal rate=0.10%, True positive rate=21.34%
+
+💧 Performance by Volume Bucket:
+  High volume: Signal rate=0.10%, Samples=7,231
+  Mid volume: Signal rate=0.22%, Samples=7,231
+  Low volume: Signal rate=0.22%, Samples=7,231
+
+✓ Robustness checks complete
+
+✓ Saved model to: /home/hamzabhatti18/Desktop/Genesis-labs/xgboost/xgb_model.json
+
+================================================================================
+FINAL CONCLUSION
+================================================================================
+
+✅ PROFITABLE STRATEGY IDENTIFIED
+
+💰 Expected Performance:
+   • Sharpe Ratio: 4.11
+   • Win Rate: 57.1%
+   • Avg Return/Trade: 6.49%
+   • Max Drawdown: 13.67%
+
+🎯 What makes this work:
+   • Strict filtering removes 90%+ of scam pairs
+   • Rare signals (only high conviction)
+   • Realistic friction costs included
+   • Time-based validation prevents leakage
+
+📈 Potential Improvements:
+   • Dynamic position sizing based on conviction
+   • Multi-timeframe confirmation
+   • More sophisticated exit logic
+   • Incorporate on-chain wallet flows
+
+================================================================================
+
+✅ ANALYSIS COMPLETE
+
+
+✅ Completed in 2.7s
+
+################################################################################
+🎉 PIPELINE COMPLETED SUCCESSFULLY
+################################################################################
+
+📁 Generated Files:
+  ✅ Processed Data: /home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet (6.19 MB)
+  ✅ Trained Model: /home/hamzabhatti18/Desktop/Genesis-labs/xgboost/xgb_model.json (0.07 MB)
+
+================================================================================
+NEXT STEPS:
+================================================================================
+
+1. Review the final conclusion in the output above
+   
+2. If PROFITABLE:
+   • Analyze feature importance
+   • Test on additional out-of-sample data
+   • Consider implementing live trading integration
+   
+3. If NOT PROFITABLE:
+   • Review suggested improvements
+   • Try different chains or timeframes
+   • Consider alternative data sources
+   
+4. Read METHODOLOGY.md for detailed explanations
+   
+5. Customize Config parameters and re-run if needed
+
+Finished at: 2026-01-23 17:31:15

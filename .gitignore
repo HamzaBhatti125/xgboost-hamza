@@ -1,0 +1,101 @@
+# ==========================================
+# Standard Python Exclusions
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# IDE Settings
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ==========================================
+# Project Specific Exclusions (test-main/)
+# ==========================================
+
+# 1. Data Files
+# Ignore all data inside the data/ folder (usually large parquets/CSVs)
+data/*
+!data/.gitkeep
+
+# Ignore loose data files in root or subdirectories
+*.parquet
+*.csv
+*.xlsx
+*.json
+*.h5
+*.hdf5
+
+# 2. Model Checkpoints & Artifacts
+# We generally don't commit large binary model files to git
+models/xgboost/*
+models/tft/*
+models/embeddings/*
+!models/xgboost/.gitkeep
+!models/tft/.gitkeep
+!models/embeddings/.gitkeep
+
+# Common model file extensions
+*.ckpt
+*.pth
+*.pt
+*.joblib
+*.pkl
+*.bin
+*.model
+*.onnx
+
+# 3. Output & Results
+output/*
+!output/.gitkeep
+
+# 4. Logs
+logs/*
+!logs/.gitkeep
+*.log
+lightning_logs/
+wandb/
+runs/
+
+# 5. Configuration
+# If config.yaml contains API keys (Binance/OpenAI keys), uncomment the next line:
+# config.yaml
+
+# If you use a separate local config for overrides:
+config_local.yaml
+secrets.yaml
+
+# 6. Testing & Coverage
+.coverage
+htmlcov/
+.pytest_cache/
