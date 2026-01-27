@@ -25,24 +25,24 @@ class Config:
     """System configuration with hard constraints"""
     
     # Data paths
-    PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
-    CANDLES_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet"
+    PAIR_UNIVERSE_PATH = "./Files/pair-universe"
+    CANDLES_PATH = "./Files/candles-15m.parquet"
     
     # Base chain selection (Base chain ID = 8453)
     BASE_CHAIN_ID = 8453
     
-    # Filtering thresholds
-    MAX_TAX_PCT = 10.0
-    MIN_AGE_DAYS = 30
-    MIN_VOLUME_30D = 10000  # USD
-    MIN_AVG_DAILY_TRADES = 5
-    MAX_SINGLE_DAY_MOVE_PCT = 30.0
-    DAYS_SINCE_LAST_SWAP = 14
+    # Filtering thresholds (loosened to capture more pairs)
+    MAX_TAX_PCT = 15.0  # Increased from 10%
+    MIN_AGE_DAYS = 7  # Reduced from 30 days
+    MIN_VOLUME_30D = 1000  # USD (reduced from 10,000)
+    MIN_AVG_DAILY_TRADES = 2  # Reduced from 5
+    MAX_SINGLE_DAY_MOVE_PCT = 200.0  # Increased from 100%
+    DAYS_SINCE_LAST_SWAP = 30  # Increased from 14
     
-    # Labeling parameters (barrier-based)
-    LABEL_UPSIDE_PCT = 8.0  # Target gain
-    LABEL_DOWNSIDE_PCT = 3.0  # Stop loss
-    LABEL_HORIZON_DAYS = 7  # Look-ahead period
+    # Labeling parameters (barrier-based, adjusted for 15-min candles)
+    LABEL_UPSIDE_PCT = 2.0  # Target gain (2% for 15-min timeframe)
+    LABEL_DOWNSIDE_PCT = 1.0  # Stop loss (1% for 15-min)
+    LABEL_HORIZON_CANDLES = 16  # Look-ahead period (16 candles = 4 hours)
     
     # Trading costs
     FEE_PCT = 0.3
@@ -78,7 +78,7 @@ def load_pair_universe_lazy() -> pl.LazyFrame:
         pattern = str(path / "*.parquet")
         df = pl.scan_parquet(pattern)
     else:
-        df = pl.scan_parquet(str(path) + ".parquet")
+        df = pl.scan_parquet(str(path))
     
     print(f"✓ Loaded pair universe (lazy mode)")
     return df
@@ -381,19 +381,19 @@ def load_candles_for_pairs(pair_ids: List[str], chunk_size: int = 5000) -> pl.Da
 # ============================================================================
 
 def engineer_features(df: pl.DataFrame) -> pl.DataFrame:
-    """Create minimal, explainable features"""
+    """Create minimal, explainable features for 15-min candles"""
     print(f"\n{'='*80}")
-    print("STEP 4: FEATURE ENGINEERING")
+    print("STEP 4: FEATURE ENGINEERING (15-MIN CANDLES)")
     print(f"{'='*80}")
     
     if len(df) == 0:
         print("⚠️  No data to engineer features from!")
         return df
     
-    print("\nCreating features:")
+    print("\nCreating features for 15-minute timeframe:")
     print("  📈 Price & Trend:")
-    print("     • 1d, 3d, 7d returns")
-    print("     • EMA(7) vs EMA(21) cross")
+    print("     • 1, 4, 16 candle returns (15min, 1h, 4h)")
+    print("     • EMA(4) vs EMA(16) cross (1h vs 4h)")
     print("     • High-low range normalized")
     
     print("  💹 Flow & Liquidity:")
@@ -402,23 +402,23 @@ def engineer_features(df: pl.DataFrame) -> pl.DataFrame:
     print("     • Trade count acceleration")
     
     print("  📊 Volatility Regime:")
-    print("     • Rolling volatility (7d, 14d)")
+    print("     • Rolling volatility (16, 96 candles = 4h, 24h)")
     print("     • Volatility contraction/expansion")
     
     try:
         # Sort by pair and timestamp
         df = df.sort(["pair_id", "timestamp"])
         
-        # Price & trend features
+        # Price & trend features (adjusted for 15-min intervals)
         df = df.with_columns([
-            # Returns
-            (pl.col("close").pct_change(1).over("pair_id")).alias("return_1d"),
-            (pl.col("close").pct_change(3).over("pair_id")).alias("return_3d"),
-            (pl.col("close").pct_change(7).over("pair_id")).alias("return_7d"),
+            # Returns at different intervals
+            (pl.col("close").pct_change(1).over("pair_id")).alias("return_1c"),  # 15min
+            (pl.col("close").pct_change(4).over("pair_id")).alias("return_4c"),  # 1 hour
+            (pl.col("close").pct_change(16).over("pair_id")).alias("return_16c"),  # 4 hours
             
-            # EMAs
-            (pl.col("close").ewm_mean(span=7).over("pair_id")).alias("ema_7"),
-            (pl.col("close").ewm_mean(span=21).over("pair_id")).alias("ema_21"),
+            # EMAs (4 candles = 1h, 16 candles = 4h)
+            (pl.col("close").ewm_mean(span=4).over("pair_id")).alias("ema_4"),
+            (pl.col("close").ewm_mean(span=16).over("pair_id")).alias("ema_16"),
             
             # Range
             ((pl.col("high") - pl.col("low")) / (pl.col("open") + 1e-10)).alias("range_normalized"),
@@ -426,7 +426,7 @@ def engineer_features(df: pl.DataFrame) -> pl.DataFrame:
         
         # EMA cross
         df = df.with_columns([
-            ((pl.col("ema_7") - pl.col("ema_21")) / (pl.col("ema_21") + 1e-10)).alias("ema_cross_signal"),
+            ((pl.col("ema_4") - pl.col("ema_16")) / (pl.col("ema_16") + 1e-10)).alias("ema_cross_signal"),
         ])
         
         # Flow features
@@ -438,26 +438,26 @@ def engineer_features(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("buys") + pl.col("sells")).alias("total_trades"),
         ])
         
-        # Volume Z-score
+        # Volume Z-score (24 candles = 6 hours rolling window)
         df = df.with_columns([
-            ((pl.col("volume") - pl.col("volume").rolling_mean(14).over("pair_id")) / 
-             (pl.col("volume").rolling_std(14).over("pair_id") + 1e-10)).alias("volume_zscore"),
+            ((pl.col("volume") - pl.col("volume").rolling_mean(24).over("pair_id")) / 
+             (pl.col("volume").rolling_std(24).over("pair_id") + 1e-10)).alias("volume_zscore"),
             
             # Trade count acceleration
             ((pl.col("total_trades") - pl.col("total_trades").shift(1).over("pair_id")) / 
              (pl.col("total_trades").shift(1).over("pair_id") + 1)).alias("trade_accel"),
         ])
         
-        # Volatility features
+        # Volatility features (16 candles = 4h, 96 candles = 24h)
         df = df.with_columns([
-            pl.col("return_1d").rolling_std(7).over("pair_id").alias("volatility_7d"),
-            pl.col("return_1d").rolling_std(14).over("pair_id").alias("volatility_14d"),
+            pl.col("return_1c").rolling_std(16).over("pair_id").alias("volatility_4h"),
+            pl.col("return_1c").rolling_std(96).over("pair_id").alias("volatility_24h"),
         ])
         
         # Volatility regime change
         df = df.with_columns([
-            ((pl.col("volatility_7d") - pl.col("volatility_14d")) / 
-             (pl.col("volatility_14d") + 1e-10)).alias("vol_regime_change"),
+            ((pl.col("volatility_4h") - pl.col("volatility_24h")) / 
+             (pl.col("volatility_24h") + 1e-10)).alias("vol_regime_change"),
         ])
         
         feature_count = len([c for c in df.columns if c not in ['pair_id', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'buy_volume', 'sell_volume', 'buys', 'sells']])
@@ -477,38 +477,34 @@ def engineer_features(df: pl.DataFrame) -> pl.DataFrame:
 
 def create_barrier_labels(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Create barrier-based labels for BUY signals
+    Create barrier-based labels for BUY signals (15-min candles)
     
-    A BUY signal is valid if within the next N days:
+    A BUY signal is valid if within the next N candles:
     - Maximum upside reaches +X% 
     - Before maximum drawdown reaches -Y%
     """
     print(f"\n{'='*80}")
-    print("STEP 5: BARRIER-BASED LABELING")
+    print("STEP 5: BARRIER-BASED LABELING (15-MIN CANDLES)")
     print(f"{'='*80}")
     
     print(f"\nLabel configuration:")
     print(f"  Target upside: +{Config.LABEL_UPSIDE_PCT}%")
     print(f"  Stop loss: -{Config.LABEL_DOWNSIDE_PCT}%")
-    print(f"  Horizon: {Config.LABEL_HORIZON_DAYS} days")
+    print(f"  Horizon: {Config.LABEL_HORIZON_CANDLES} candles (~{Config.LABEL_HORIZON_CANDLES * 15 / 60:.1f} hours)")
     print(f"  Logic: Upside must be hit BEFORE downside")
     
     # Sort by pair and timestamp
     df = df.sort(["pair_id", "timestamp"])
     
-    # Calculate forward returns for the next N days
-    labels = []
-    
-    for horizon in range(1, Config.LABEL_HORIZON_DAYS + 1):
+    # Calculate forward returns for the next N candles
+    for horizon in range(1, Config.LABEL_HORIZON_CANDLES + 1):
         df = df.with_columns([
-            (pl.col("close").shift(-horizon).over("pair_id") / pl.col("close") - 1).alias(f"fwd_return_{horizon}d")
+            (pl.col("close").shift(-horizon).over("pair_id") / pl.col("close") - 1).alias(f"fwd_return_{horizon}c")
         ])
     
     # For each row, check if upside barrier is hit before downside
-    # This requires checking the sequence of returns
-    
     # Simple vectorized approach: check max upside and max downside
-    forward_cols = [f"fwd_return_{i}d" for i in range(1, Config.LABEL_HORIZON_DAYS + 1)]
+    forward_cols = [f"fwd_return_{i}c" for i in range(1, Config.LABEL_HORIZON_CANDLES + 1)]
     
     df = df.with_columns([
         pl.max_horizontal([pl.col(c) for c in forward_cols]).alias("max_upside"),
@@ -516,7 +512,6 @@ def create_barrier_labels(df: pl.DataFrame) -> pl.DataFrame:
     ])
     
     # Label as BUY (1) if max_upside >= threshold AND abs(max_downside) < stop_loss
-    # This is a simplified version - true barrier labeling requires checking sequence
     df = df.with_columns([
         (
             (pl.col("max_upside") >= Config.LABEL_UPSIDE_PCT / 100) &
@@ -603,7 +598,7 @@ def main():
         print(f"\n✓ Final dataset: {len(candles_clean):,} samples across {candles_clean['pair_id'].n_unique():,} pairs")
         
         # Save processed data
-        output_path = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet"
+        output_path = "./processed_data.parquet"
         candles_clean.write_parquet(output_path)
         print(f"\n✓ Saved processed data to: {output_path}")
         

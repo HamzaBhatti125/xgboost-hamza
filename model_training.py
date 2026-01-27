@@ -25,18 +25,18 @@ class Config:
     """Model and backtesting configuration"""
     
     # Data path
-    PROCESSED_DATA_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet"
+    PROCESSED_DATA_PATH = "./processed_data.parquet"
     
     # Train/test split (time-based, NO SHUFFLE)
     TRAIN_END_DATE = "2024-06-30"
     TEST_START_DATE = "2024-07-01"
     
-    # Feature columns
+    # Feature columns (15-minute candles)
     FEATURE_COLS = [
-        "return_1d", "return_3d", "return_7d",
+        "return_1c", "return_4c", "return_16c",
         "ema_cross_signal", "range_normalized",
         "buy_sell_ratio", "volume_zscore", "trade_accel",
-        "volatility_7d", "volatility_14d", "vol_regime_change"
+        "volatility_4h", "volatility_24h", "vol_regime_change"
     ]
     
     TARGET_COL = "signal_label"
@@ -61,9 +61,9 @@ class Config:
     # Signal threshold (optimize for precision)
     SIGNAL_THRESHOLD = 0.7  # Only trade on high-confidence signals
     
-    # Backtesting parameters
-    ENTRY_DELAY_DAYS = 1  # Enter at next day's open
-    HOLDING_PERIOD_DAYS = 7  # Max holding period
+    # Backtesting parameters (15-min candles)
+    ENTRY_DELAY_CANDLES = 1  # Enter at next candle open
+    HOLDING_PERIOD_CANDLES = 16  # Max holding period (4 hours)
     FEE_PCT = 0.3
     SLIPPAGE_PCT = 0.2
     TOTAL_FRICTION_PCT = FEE_PCT + SLIPPAGE_PCT
@@ -264,8 +264,8 @@ def backtest_strategy(df: pl.DataFrame, predictions: np.ndarray, split_name: str
     print(f"{'='*80}")
     
     print(f"\n📋 Backtesting Rules:")
-    print(f"  • Entry: Next day open (T+1)")
-    print(f"  • Exit: Max {Config.HOLDING_PERIOD_DAYS} days")
+    print(f"  • Entry: Next candle open (T+1)")
+    print(f"  • Exit: Max {Config.HOLDING_PERIOD_CANDLES} candles (~{Config.HOLDING_PERIOD_CANDLES*15/60:.1f} hours)")
     print(f"  • Fees: {Config.FEE_PCT}%")
     print(f"  • Slippage: {Config.SLIPPAGE_PCT}%")
     print(f"  • Total friction: {Config.TOTAL_FRICTION_PCT}%")
@@ -304,14 +304,14 @@ def backtest_strategy(df: pl.DataFrame, predictions: np.ndarray, split_name: str
         # Check if we should exit existing positions
         for pair_id, position in list(active_positions.items()):
             if row['pair_id'] == pair_id:
-                days_held = (timestamp - position['entry_timestamp']).days
+                candles_held = idx - position['entry_idx']
                 
                 # Exit conditions
                 should_exit = False
                 exit_reason = ""
                 
                 # Max holding period
-                if days_held >= Config.HOLDING_PERIOD_DAYS:
+                if candles_held >= Config.HOLDING_PERIOD_CANDLES:
                     should_exit = True
                     exit_reason = "max_hold"
                 
@@ -328,7 +328,7 @@ def backtest_strategy(df: pl.DataFrame, predictions: np.ndarray, split_name: str
                         'entry_price': position['entry_price'],
                         'exit_price': exit_price_adj,
                         'pnl_pct': pnl * 100,
-                        'days_held': days_held,
+                        'candles_held': candles_held,
                         'exit_reason': exit_reason
                     })
                     
@@ -355,8 +355,9 @@ def backtest_strategy(df: pl.DataFrame, predictions: np.ndarray, split_name: str
     avg_return = trades_df['pnl_pct'].mean()
     std_return = trades_df['pnl_pct'].std()
     
-    # Sharpe ratio (annualized, assuming ~250 trading days)
-    sharpe = (avg_return * 250) / (std_return * np.sqrt(250)) if std_return > 0 else 0
+    # Sharpe ratio (annualized for 15-min candles: 4*24*250 = 24,000 candles/year)
+    candles_per_year = 4 * 24 * 250
+    sharpe = (avg_return * candles_per_year) / (std_return * np.sqrt(candles_per_year)) if std_return > 0 else 0
     
     # Win rate
     winning_trades = (trades_df['pnl_pct'] > 0).sum()
@@ -378,7 +379,7 @@ def backtest_strategy(df: pl.DataFrame, predictions: np.ndarray, split_name: str
     print(f"  Sharpe ratio: {sharpe:.2f}")
     print(f"  Max drawdown: {max_drawdown:.2f}%")
     print(f"  Win rate: {win_rate:.1f}%")
-    print(f"  Avg days held: {trades_df['days_held'].mean():.1f}")
+    print(f"  Avg candles held: {trades_df['candles_held'].mean():.1f} (~{trades_df['candles_held'].mean()*15/60:.1f} hours)")
     
     # Profitability assessment
     profitable = (sharpe >= Config.MIN_SHARPE_THRESHOLD and 
@@ -477,7 +478,7 @@ def main():
     robustness_analysis(model, df_test, test_results['predictions'])
     
     # Save model
-    model_path = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/xgb_model.json"
+    model_path = "./xgb_model.json"
     model.save_model(model_path)
     print(f"\n✓ Saved model to: {model_path}")
     

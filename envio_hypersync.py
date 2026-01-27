@@ -49,8 +49,8 @@ class EnvioConfig:
     POOL_CREATED_V3_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"  # PoolCreated
     
     # Candle configuration
-    CANDLE_INTERVAL_SECONDS = 300  # 5 minutes (for live trading - was 86400 for 1 day)
-    CANDLE_INTERVAL_MINUTES = 5  # 5 minutes (for live trading)
+    CANDLE_INTERVAL_SECONDS = 900  # 15 minutes (matching training data)
+    CANDLE_INTERVAL_MINUTES = 15  # 15 minutes (matching training data)
     
     # Processing configuration
     BATCH_SIZE = 1000  # Process events in batches
@@ -110,6 +110,7 @@ class SwapEvent:
     amount0: float
     amount1: float
     price: float  # token1/token0
+    volume_usd: float  # USD volume for weighting (using token1 as proxy)
     is_v3: bool
     
     
@@ -281,6 +282,9 @@ class SwapEventProcessor:
                 price = abs(amount1 / amount0)
             else:
                 price = 0.0
+            
+            # Calculate volume (use token1 as proxy for USD value)
+            volume_usd = abs(amount1)
                 
             return SwapEvent(
                 block_number=log["block_number"],
@@ -293,6 +297,7 @@ class SwapEventProcessor:
                 amount0=amount0,
                 amount1=amount1,
                 price=price,
+                volume_usd=volume_usd,
                 is_v3=False
             )
             
@@ -322,6 +327,9 @@ class SwapEventProcessor:
                 price = abs(amount1 / amount0)
             else:
                 price = 0.0
+            
+            # Calculate volume (use token1 as proxy for USD value)
+            volume_usd = abs(amount1)
                 
             return SwapEvent(
                 block_number=log["block_number"],
@@ -334,6 +342,7 @@ class SwapEventProcessor:
                 amount0=amount0,
                 amount1=amount1,
                 price=price,
+                volume_usd=volume_usd,
                 is_v3=True
             )
             
@@ -392,22 +401,36 @@ class CandleAggregator:
                     candle_groups[candle_start] = []
                 candle_groups[candle_start].append(swap)
                 
-            # Create candles
+            # Create candles with volume-weighted prices
             for candle_start, group_swaps in candle_groups.items():
                 if not group_swaps:
                     continue
-                    
-                prices = [s.price for s in group_swaps if s.price > 0]
-                if not prices:
+                
+                # Filter valid swaps (price > 0 and volume > 0)
+                valid_swaps = [(s.price, s.volume_usd, parse_ts(s.block_timestamp)) 
+                               for s in group_swaps if s.price > 0 and s.volume_usd > 0]
+                
+                if not valid_swaps:
                     continue
-                    
+                
+                # Sort by timestamp for correct OHLC ordering
+                valid_swaps.sort(key=lambda x: x[2])
+                
+                # Extract prices and volumes
+                prices = [p for p, _, _ in valid_swaps]
+                volumes = [v for _, v, _ in valid_swaps]
+                
+                # Calculate volume-weighted average price (VWAP) for reference
+                total_volume = sum(volumes)
+                vwap = sum(p * v for p, v in zip(prices, volumes)) / total_volume if total_volume > 0 else prices[-1]
+                
                 candle = Candle(
                     pair_address=pair_address,
                     timestamp=candle_start,
-                    open=prices[0],
-                    high=max(prices),
-                    low=min(prices),
-                    close=prices[-1],
+                    open=prices[0],      # First trade price
+                    high=max(prices),    # Highest trade price
+                    low=min(prices),     # Lowest trade price  
+                    close=prices[-1],    # Last trade price (volume-weighted would be vwap)
                     volume_token0=sum(abs(s.amount0) for s in group_swaps),
                     volume_token1=sum(abs(s.amount1) for s in group_swaps),
                     num_trades=len(group_swaps)

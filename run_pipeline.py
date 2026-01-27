@@ -59,8 +59,8 @@ def check_data_exists():
     print("📋 PRE-FLIGHT CHECK")
     print(f"{'='*80}\n")
     
-    pair_universe = Path("/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe")
-    candles = Path("/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet")
+    pair_universe = Path("./Files/pair-universe")
+    candles = Path("./Files/candles-1d.parquet")
     
     checks = [
         ("Pair universe", pair_universe.exists()),
@@ -113,7 +113,7 @@ def main():
         sys.exit(1)
     
     # Check if processed data was created
-    processed_data = Path("/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet")
+    processed_data = Path("./processed_data.parquet")
     if not processed_data.exists():
         print("\n❌ Processed data file not found!")
         print(f"   Expected: {processed_data}")
@@ -140,8 +140,8 @@ def main():
     
     print("\n📁 Generated Files:")
     files = [
-        ("Processed Data", "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet"),
-        ("Trained Model", "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/xgb_model.json"),
+        ("Processed Data", "./processed_data.parquet"),
+        ("Trained Model", "./xgb_model.json"),
     ]
     
     for name, path in files:

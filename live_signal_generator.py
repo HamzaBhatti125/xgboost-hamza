@@ -34,20 +34,20 @@ class LiveConfig:
     """Configuration for live signal generation"""
     
     # Model configuration
-    MODEL_PATH = "xgb_model.json"
-    SIGNAL_THRESHOLD = 0.5  # High confidence threshold
+    MODEL_PATH = "xgb_model.json"  # Newly trained model
+    SIGNAL_THRESHOLD = 0.9  # High confidence threshold (optimized in training)
     
-    # Feature names (must match training)
+    # Feature names (must match training - 15-min candles)
     FEATURE_COLS = [
-        "return_1d", "return_3d", "return_7d",
+        "return_1c", "return_4c", "return_16c",
         "ema_cross_signal", "range_normalized",
         "buy_sell_ratio", "volume_zscore", "trade_accel",
-        "volatility_7d", "volatility_14d", "vol_regime_change"
+        "volatility_4h", "volatility_24h", "vol_regime_change"
     ]
     
     # Data requirements for features
-    MIN_HISTORY_CANDLES = 300  # Need ~300 candles (25 hours at 5min intervals) for features
-    UPDATE_INTERVAL_SECONDS = 300  # Generate signals every 5 minutes
+    MIN_HISTORY_CANDLES = 20  # Need ~20 candles (5 hours at 15min intervals) for features
+    UPDATE_INTERVAL_SECONDS = 900  # Generate signals every 15 minutes (matching candle interval)
     
     # Output configuration
     SIGNALS_OUTPUT_PATH = "signals_live.csv"
@@ -66,25 +66,25 @@ class FeatureEngineer:
     
     @staticmethod
     def compute_returns(df: pl.DataFrame) -> pl.DataFrame:
-        """Compute price returns"""
+        """Compute price returns (15-min candles)"""
         return df.with_columns([
-            (100 * (pl.col("close") / pl.col("close").shift(1) - 1)).alias("return_1d"),
-            (100 * (pl.col("close") / pl.col("close").shift(3) - 1)).alias("return_3d"),
-            (100 * (pl.col("close") / pl.col("close").shift(7) - 1)).alias("return_7d"),
+            (100 * (pl.col("close") / pl.col("close").shift(1) - 1)).alias("return_1c"),
+            (100 * (pl.col("close") / pl.col("close").shift(4) - 1)).alias("return_4c"),
+            (100 * (pl.col("close") / pl.col("close").shift(16) - 1)).alias("return_16c"),
         ])
     
     @staticmethod
     def compute_ema_cross(df: pl.DataFrame) -> pl.DataFrame:
-        """Compute EMA crossover signal"""
+        """Compute EMA crossover signal (4 vs 16 candles = 1h vs 4h)"""
         df = df.with_columns([
-            pl.col("close").ewm_mean(span=5, adjust=False).alias("ema_5"),
-            pl.col("close").ewm_mean(span=20, adjust=False).alias("ema_20"),
+            pl.col("close").ewm_mean(span=4, adjust=False).alias("ema_4"),
+            pl.col("close").ewm_mean(span=16, adjust=False).alias("ema_16"),
         ])
         
         return df.with_columns([
-            ((pl.col("ema_5") > pl.col("ema_20")).cast(pl.Int32) -
-             (pl.col("ema_5") <= pl.col("ema_20")).cast(pl.Int32)).alias("ema_cross_signal")
-        ]).drop(["ema_5", "ema_20"])
+            ((pl.col("ema_4") > pl.col("ema_16")).cast(pl.Int32) -
+             (pl.col("ema_4") <= pl.col("ema_16")).cast(pl.Int32)).alias("ema_cross_signal")
+        ]).drop(["ema_4", "ema_16"])
     
     @staticmethod
     def compute_range_normalized(df: pl.DataFrame) -> pl.DataFrame:
@@ -116,15 +116,15 @@ class FeatureEngineer:
     
     @staticmethod
     def compute_volatility(df: pl.DataFrame) -> pl.DataFrame:
-        """Compute volatility features"""
+        """Compute volatility features (4h = 16 candles, 24h = 96 candles)"""
         df = df.with_columns([
-            pl.col("return_1d").rolling_std(7).alias("volatility_7d"),
-            pl.col("return_1d").rolling_std(14).alias("volatility_14d"),
+            pl.col("return_1c").rolling_std(16).alias("volatility_4h"),
+            pl.col("return_1c").rolling_std(96).alias("volatility_24h"),
         ])
         
         # Volatility regime change
         df = df.with_columns([
-            (100 * (pl.col("volatility_7d") / (pl.col("volatility_14d") + 1e-9) - 1)).alias("vol_regime_change")
+            (100 * (pl.col("volatility_4h") / (pl.col("volatility_24h") + 1e-9) - 1)).alias("vol_regime_change")
         ])
         
         return df

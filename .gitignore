@@ -52,7 +52,6 @@ data/*
 *.parquet
 *.csv
 *.xlsx
-*.json
 *.h5
 *.hdf5
 
