@@ -258,8 +258,39 @@ class EnvioHypersyncClient:
 class SwapEventProcessor:
     """Processes swap events from Hypersync into structured data"""
     
-    def __init__(self):
+    def __init__(self, pair_universe_path: str = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe.parquet"):
         self.pair_info: Dict[str, Dict] = {}  # Cache pair info
+        self._load_pair_universe(pair_universe_path)
+    
+    def _load_pair_universe(self, path: str):
+        """Load pair universe data with decimals information"""
+        try:
+            df = pl.read_parquet(path)
+            # Create lookup dict: address -> {token0_decimals, token1_decimals, ...}
+            for row in df.iter_rows(named=True):
+                address = row.get('address', '').lower()
+                if address:
+                    self.pair_info[address] = {
+                        'token0_decimals': row.get('token0_decimals', 18),
+                        'token1_decimals': row.get('token1_decimals', 18),
+                        'token0_address': row.get('token0_address', ''),
+                        'token1_address': row.get('token1_address', ''),
+                        'token0_symbol': row.get('token0_symbol', ''),
+                        'token1_symbol': row.get('token1_symbol', '')
+                    }
+            logger.info(f"Loaded {len(self.pair_info)} pairs from universe")
+        except Exception as e:
+            logger.warning(f"Could not load pair universe: {e}. Will use default 18 decimals.")
+    
+    def _get_decimals(self, pair_address: str) -> tuple:
+        """Get token decimals for a pair, returns (token0_decimals, token1_decimals)"""
+        pair_address = pair_address.lower()
+        if pair_address in self.pair_info:
+            info = self.pair_info[pair_address]
+            return (info.get('token0_decimals', 18), info.get('token1_decimals', 18))
+        # Default to 18 if not found
+        logger.debug(f"Pair {pair_address} not found in universe, using default 18 decimals")
+        return (18, 18)
         
     def decode_v2_swap(self, log: Dict) -> Optional[SwapEvent]:
         """Decode Uniswap V2 swap event"""
@@ -273,9 +304,12 @@ class SwapEventProcessor:
             amount0_out = int.from_bytes(data[64:96], byteorder='big')
             amount1_out = int.from_bytes(data[96:128], byteorder='big')
             
-            # Calculate net amounts (in is negative, out is positive)
-            amount0 = float(amount0_out - amount0_in) / 1e18
-            amount1 = float(amount1_out - amount1_in) / 1e18
+            # Get correct decimals for this pair
+            token0_decimals, token1_decimals = self._get_decimals(log["address"])
+            
+            # Calculate net amounts (in is negative, out is positive) using correct decimals
+            amount0 = float(amount0_out - amount0_in) / (10 ** token0_decimals)
+            amount1 = float(amount1_out - amount1_in) / (10 ** token1_decimals)
             
             # Calculate price (avoid division by zero)
             if amount0 != 0:
@@ -319,8 +353,12 @@ class SwapEventProcessor:
             amount0_raw = int.from_bytes(amount0_bytes, byteorder='big', signed=True)
             amount1_raw = int.from_bytes(amount1_bytes, byteorder='big', signed=True)
             
-            amount0 = float(amount0_raw) / 1e18
-            amount1 = float(amount1_raw) / 1e18
+            # Get correct decimals for this pair
+            token0_decimals, token1_decimals = self._get_decimals(log["address"])
+            
+            # Convert amounts using correct decimals
+            amount0 = float(amount0_raw) / (10 ** token0_decimals)
+            amount1 = float(amount1_raw) / (10 ** token1_decimals)
             
             # Calculate price
             if amount0 != 0:
