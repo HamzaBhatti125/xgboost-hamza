@@ -5,7 +5,7 @@ import polars as pl
 from pathlib import Path
 
 # Load pair universe
-pair_universe_path = Path("/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe")
+pair_universe_path = Path("Files/pair-universe")
 print(f"Loading pair universe from: {pair_universe_path}")
 
 df = pl.scan_parquet(pair_universe_path / "*.parquet")

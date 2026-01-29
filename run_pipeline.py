@@ -59,8 +59,8 @@ def check_data_exists():
     print("📋 PRE-FLIGHT CHECK")
     print(f"{'='*80}\n")
     
-    pair_universe = Path("/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe")
-    candles = Path("/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet")
+    pair_universe = Path("Files/pair-universe")
+    candles = Path("Files/candles-1d.parquet")
     
     checks = [
         ("Pair universe", pair_universe.exists()),

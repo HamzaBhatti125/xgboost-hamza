@@ -15,7 +15,7 @@ import argparse
 from pathlib import Path
 
 
-def get_pair_info(pair_id: int, data_path: str = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe.parquet"):
+def get_pair_info(pair_id: int, data_path: str = "Files/pair-universe"):
     """Get detailed information about a trading pair"""
     
     data_path = Path(data_path)
@@ -170,7 +170,7 @@ Examples:
     parser.add_argument(
         "--data-path",
         type=str,
-        default="/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe.parquet",
+        default="Files/pair-universe",
         help="Path to pair-universe data (default: %(default)s)"
     )
     

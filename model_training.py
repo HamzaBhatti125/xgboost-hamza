@@ -25,7 +25,7 @@ class Config:
     """Model and backtesting configuration"""
     
     # Data path
-    PROCESSED_DATA_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet"
+    PROCESSED_DATA_PATH = "processed_data.parquet"
     
     # Train/test split (time-based, NO SHUFFLE)
     TRAIN_END_DATE = "2024-06-30"
@@ -477,7 +477,7 @@ def main():
     robustness_analysis(model, df_test, test_results['predictions'])
     
     # Save model
-    model_path = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/xgb_model.json"
+    model_path = "xgb_model.json"
     model.save_model(model_path)
     print(f"\n✓ Saved model to: {model_path}")
     

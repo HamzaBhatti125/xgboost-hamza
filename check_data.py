@@ -7,8 +7,8 @@ from pathlib import Path
 print("Checking data paths...")
 
 # Check paths
-pair_universe = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
-candles = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet"
+pair_universe = "Files/pair-universe"
+candles = "Files/candles-1d.parquet"
 
 print(f"\nPair universe path: {pair_universe}")
 print(f"  Exists: {Path(pair_universe).exists()}")

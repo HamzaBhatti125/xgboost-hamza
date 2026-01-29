@@ -12,8 +12,8 @@ from datetime import datetime
 import sys
 
 # Configuration
-PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
-CANDLES_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet"
+PAIR_UNIVERSE_PATH = "Files/pair-universe"
+CANDLES_PATH = "Files/candles-1d.parquet"
 BASE_CHAIN_ID = 8453
 
 print(f"\n{'#'*80}")

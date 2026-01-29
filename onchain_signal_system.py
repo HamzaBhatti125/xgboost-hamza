@@ -25,8 +25,8 @@ class Config:
     """System configuration with hard constraints"""
     
     # Data paths
-    PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
-    CANDLES_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/candles-1d.parquet"
+    PAIR_UNIVERSE_PATH = "Files/pair-universe"
+    CANDLES_PATH = "Files/candles-1d.parquet"
     
     # Base chain selection (Base chain ID = 8453)
     BASE_CHAIN_ID = 8453
@@ -77,8 +77,16 @@ def load_pair_universe_lazy() -> pl.LazyFrame:
     if path.is_dir():
         pattern = str(path / "*.parquet")
         df = pl.scan_parquet(pattern)
+    elif path.is_file():
+        # It's a file, try to read it directly
+        df = pl.scan_parquet(str(path))
     else:
-        df = pl.scan_parquet(str(path) + ".parquet")
+        # Try with .parquet extension
+        parquet_path = Path(str(path) + ".parquet")
+        if parquet_path.exists():
+            df = pl.scan_parquet(str(parquet_path))
+        else:
+            raise FileNotFoundError(f"Pair universe not found: {path}")
     
     print(f"✓ Loaded pair universe (lazy mode)")
     return df
@@ -603,7 +611,7 @@ def main():
         print(f"\n✓ Final dataset: {len(candles_clean):,} samples across {candles_clean['pair_id'].n_unique():,} pairs")
         
         # Save processed data
-        output_path = "/home/hamzabhatti18/Desktop/Genesis-labs/xgboost/processed_data.parquet"
+        output_path = "processed_data.parquet"
         candles_clean.write_parquet(output_path)
         print(f"\n✓ Saved processed data to: {output_path}")
         
