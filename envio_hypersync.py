@@ -258,7 +258,7 @@ class EnvioHypersyncClient:
 class SwapEventProcessor:
     """Processes swap events from Hypersync into structured data"""
     
-    def __init__(self, pair_universe_path: str = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe.parquet"):
+    def __init__(self, pair_universe_path: str = "./Files/pair-universe"):
         self.pair_info: Dict[str, Dict] = {}  # Cache pair info
         self._load_pair_universe(pair_universe_path)
     
@@ -620,6 +620,89 @@ class LiveSwapStreamer:
                     logger.error(f"Error in stream_swaps: {e}", exc_info=True)
                     await asyncio.sleep(EnvioConfig.POLL_INTERVAL_SECONDS)
                     
+    async def backfill_historical_candles(self, hours: int = 25) -> pl.DataFrame:
+        """Backfill candles from recent history to populate features properly"""
+        logger.info(f"🔄 Backfilling {hours} hours of historical data...")
+        
+        try:
+            # Initialize current_block if not set by querying latest block
+            if self.current_block is None:
+                self.current_block = await self.client.get_current_block()
+                logger.info(f"Initialized current_block to {self.current_block}")
+
+            # Calculate block range (Base chain: ~2 sec per block = 1800 blocks/hour)
+            blocks_per_hour = 1800
+            from_block = max(0, self.current_block - (hours * blocks_per_hour))
+            to_block = self.current_block
+            
+            logger.info(f"Querying blocks {from_block} to {to_block}")
+            
+            # Create temporary aggregator for historical data
+            historical_aggregator = CandleAggregator(interval_seconds=EnvioConfig.CANDLE_INTERVAL_SECONDS)
+            
+            # Query in chunks to avoid overwhelming the API
+            chunk_size = 10000
+            total_swaps = 0
+            
+            for chunk_start in range(from_block, to_block, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, to_block)
+                
+                # Query V2 and V3 swap events using existing method
+                v2_logs = await self.client.query_logs(
+                    from_block=chunk_start,
+                    to_block=chunk_end,
+                    topics=[EnvioConfig.SWAP_V2_TOPIC]
+                )
+                
+                v3_logs = await self.client.query_logs(
+                    from_block=chunk_start,
+                    to_block=chunk_end,
+                    topics=[EnvioConfig.SWAP_V3_TOPIC]
+                )
+                
+                # Process V2 swaps
+                for log in v2_logs:
+                    swap = self.processor.decode_v2_swap(log)
+                    if swap:
+                        historical_aggregator.add_swap(swap)
+                        total_swaps += 1
+                
+                # Process V3 swaps
+                for log in v3_logs:
+                    swap = self.processor.decode_v3_swap(log)
+                    if swap:
+                        historical_aggregator.add_swap(swap)
+                        total_swaps += 1
+                
+                logger.info(f"  Processed blocks {chunk_start}-{chunk_end}: {total_swaps} swaps so far")
+                await asyncio.sleep(0.1)  # Rate limiting
+            
+            # Generate candles from all historical swaps
+            candles = historical_aggregator.generate_candles()
+            logger.info(f"✅ Backfill complete: {total_swaps} swaps → {len(candles)} candles")
+            
+            # Convert to DataFrame
+            if not candles:
+                return pl.DataFrame()
+            
+            data = {
+                "pair_address": [c.pair_address for c in candles],
+                "timestamp": [datetime.fromtimestamp(c.timestamp) for c in candles],
+                "open": [c.open for c in candles],
+                "high": [c.high for c in candles],
+                "low": [c.low for c in candles],
+                "close": [c.close for c in candles],
+                "volume_token0": [c.volume_token0 for c in candles],
+                "volume_token1": [c.volume_token1 for c in candles],
+                "num_trades": [c.num_trades for c in candles],
+            }
+            
+            return pl.DataFrame(data)
+            
+        except Exception as e:
+            logger.error(f"Backfill failed: {e}", exc_info=True)
+            return pl.DataFrame()
+    
     def get_latest_candles(self) -> pl.DataFrame:
         """Get latest candles from aggregator"""
         candles = self.aggregator.generate_candles()

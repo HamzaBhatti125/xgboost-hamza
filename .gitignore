@@ -54,6 +54,7 @@ data/*
 *.xlsx
 *.h5
 *.hdf5
+features.json
 
 # 2. Model Checkpoints & Artifacts
 # We generally don't commit large binary model files to git
