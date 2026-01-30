@@ -48,10 +48,24 @@ def load_signal_file(filepath: str) -> pl.DataFrame:
     
     df = df.with_columns([
         pl.col("timestamp").str.to_datetime().alias("entry_time"),
-        pl.col("generated_at").str.to_datetime().alias("generated_time")
     ])
     
+    # Handle generated_at if it exists
+    if "generated_at" in df.columns:
+        df = df.with_columns([
+            pl.col("generated_at").str.to_datetime().alias("generated_time")
+        ])
+    
+    # Ensure signal_type exists (default to OHLCV for old files)
+    if "signal_type" not in df.columns:
+        df = df.with_columns([pl.lit("OHLCV").alias("signal_type")])
+    
+    # Show signal type breakdown
+    signal_types = df["signal_type"].value_counts()
     print(f"   Found {len(df)} signals")
+    for row in signal_types.iter_rows(named=True):
+        print(f"      {row['signal_type']}: {row['count']} signals")
+    
     return df
 
 
@@ -175,11 +189,22 @@ def track_signals(signal_file: str, max_pairs: int = None):
         # Calculate return
         actual_return_pct = ((latest_price - entry_price) / entry_price) * 100
         
+        # Use signal-specific take profit/stop loss if available (for BB signals)
+        signal_type = signal.get("signal_type", "OHLCV")
+        take_profit_pct = signal.get("take_profit_pct", TARGET_PROFIT_PCT)
+        stop_loss_pct = signal.get("stop_loss_pct", STOP_LOSS_PCT)
+        
+        # If take_profit_price and stop_loss_price exist, calculate percentages from entry
+        if "take_profit_price" in signal and signal["take_profit_price"] is not None:
+            take_profit_pct = ((signal["take_profit_price"] - entry_price) / entry_price) * 100
+        if "stop_loss_price" in signal and signal["stop_loss_price"] is not None:
+            stop_loss_pct = ((signal["stop_loss_price"] - entry_price) / entry_price) * 100
+        
         # Determine outcome
         if signal["window_status"] == "PENDING":
-            if actual_return_pct >= TARGET_PROFIT_PCT:
+            if actual_return_pct >= take_profit_pct:
                 outcome = "WIN_ACTIVE"
-            elif actual_return_pct <= STOP_LOSS_PCT:
+            elif actual_return_pct <= stop_loss_pct:
                 outcome = "LOSS_ACTIVE"
             else:
                 outcome = "PENDING"
@@ -199,33 +224,48 @@ def track_signals(signal_file: str, max_pairs: int = None):
                 min_price = window_candles["low"].min()
                 min_return = ((min_price - entry_price) / entry_price) * 100
                 
-                if max_return >= TARGET_PROFIT_PCT:
+                if max_return >= take_profit_pct:
                     outcome = "WIN"
-                elif min_return <= STOP_LOSS_PCT:
+                elif min_return <= stop_loss_pct:
                     outcome = "LOSS"
                 else:
                     outcome = "NEUTRAL"
             else:
                 # No candles in window, use latest
-                if actual_return_pct >= TARGET_PROFIT_PCT:
+                if actual_return_pct >= take_profit_pct:
                     outcome = "WIN"
-                elif actual_return_pct <= STOP_LOSS_PCT:
+                elif actual_return_pct <= stop_loss_pct:
                     outcome = "LOSS"
                 else:
                     outcome = "NEUTRAL"
         
-        results.append({
+        # Build result dict with base fields
+        result = {
             "pair_address": pair_address,
             "entry_time": entry_time,
             "hours_elapsed": round(signal["hours_elapsed"], 2),
-            "pred_proba": signal["pred_proba"],
+            "pred_proba": signal.get("pred_proba", 0.0),
+            "signal_type": signal_type,
             "entry_price": entry_price,
             "current_price": latest_price,
             "latest_candle_time": latest_time,
             "actual_return_pct": round(actual_return_pct, 2),
+            "take_profit_pct": round(take_profit_pct, 2),
+            "stop_loss_pct": round(stop_loss_pct, 2),
             "outcome": outcome,
             "window_status": signal["window_status"]
-        })
+        }
+        
+        # Add BB-specific fields if this is a BB signal
+        if signal_type == "BB":
+            result["bb_middle"] = signal.get("bb_middle")
+            result["bb_upper"] = signal.get("bb_upper")
+            result["bb_lower"] = signal.get("bb_lower")
+            result["bb_width"] = signal.get("bb_width")
+            result["bb_position"] = signal.get("bb_position")
+            result["bb_signal_reason"] = signal.get("bb_signal_reason", "unknown")
+        
+        results.append(result)
         
         success_count += 1
         
@@ -249,14 +289,29 @@ def track_signals(signal_file: str, max_pairs: int = None):
     print(f"   Successfully Tracked: {success_count}")
     print(f"   Failed: {len(results_df) - success_count}")
     
-    # Outcome breakdown
-    print("\n🎯 OUTCOMES:")
+    # Outcome breakdown (overall)
+    print("\n🎯 OUTCOMES (Overall):")
     for row in results_df.filter(
         ~pl.col("outcome").str.contains("NO_")
     ).group_by("outcome").len().sort("outcome").iter_rows(named=True):
         count = row['len']
         pct = (count / success_count * 100) if success_count > 0 else 0
         print(f"   {row['outcome']:15s}: {count:3d} ({pct:5.1f}%)")
+    
+    # Outcome breakdown by signal type
+    if "signal_type" in results_df.columns:
+        print("\n🎯 OUTCOMES BY SIGNAL TYPE:")
+        for signal_type in results_df["signal_type"].unique().to_list():
+            type_df = results_df.filter(
+                (pl.col("signal_type") == signal_type) &
+                ~pl.col("outcome").str.contains("NO_")
+            )
+            if len(type_df) > 0:
+                print(f"\n   {signal_type} Signals ({len(type_df)} total):")
+                for row in type_df.group_by("outcome").len().sort("outcome").iter_rows(named=True):
+                    count = row['len']
+                    pct = (count / len(type_df) * 100) if len(type_df) > 0 else 0
+                    print(f"      {row['outcome']:15s}: {count:3d} ({pct:5.1f}%)")
     
     # Calculate win rate
     completed = results_df.filter(
@@ -279,7 +334,7 @@ def track_signals(signal_file: str, max_pairs: int = None):
         print(f"   Neutral: {neutral:3d} ({neutral/len(completed)*100:5.1f}%)")
         
         if wins + losses > 0:
-            print(f"\n   📊 WIN RATE: {win_rate:.1f}% (Model predicted: 91.7%)")
+            print(f"\n   📊 WIN RATE: {win_rate:.1f}%")
             print(f"      Based on {wins + losses} completed signals (wins + losses)")
         
         # Average returns
@@ -292,6 +347,29 @@ def track_signals(signal_file: str, max_pairs: int = None):
         if len(loss_returns) > 0:
             avg_loss = loss_returns["actual_return_pct"].mean()
             print(f"   📉 Avg Loss Return: {avg_loss:.2f}%")
+        
+        # Performance by signal type
+        if "signal_type" in completed.columns:
+            print(f"\n📊 PERFORMANCE BY SIGNAL TYPE:")
+            for signal_type in completed["signal_type"].unique().to_list():
+                type_completed = completed.filter(pl.col("signal_type") == signal_type)
+                type_wins = len(type_completed.filter(pl.col("outcome").is_in(["WIN", "WIN_ACTIVE"])))
+                type_losses = len(type_completed.filter(pl.col("outcome").is_in(["LOSS", "LOSS_ACTIVE"])))
+                type_pending = len(type_completed.filter(pl.col("outcome") == "PENDING"))
+                type_neutral = len(type_completed.filter(pl.col("outcome") == "NEUTRAL"))
+                
+                type_wr = (type_wins / (type_wins + type_losses) * 100) if (type_wins + type_losses) > 0 else 0
+                
+                print(f"\n   {signal_type} ({len(type_completed)} signals):")
+                print(f"      Wins: {type_wins:3d} | Losses: {type_losses:3d} | Pending: {type_pending:3d} | Neutral: {type_neutral:3d}")
+                if type_wins + type_losses > 0:
+                    print(f"      Win Rate: {type_wr:.1f}%")
+                
+                # BB-specific metrics
+                if signal_type == "BB" and "bb_signal_reason" in type_completed.columns:
+                    print(f"      BB Signal Reasons:")
+                    for row in type_completed.group_by("bb_signal_reason").len().sort("len", descending=True).iter_rows(named=True):
+                        print(f"         {row['bb_signal_reason']}: {row['len']} signals")
     
     # Top performers
     print("\n🏆 TOP 20 SIGNALS (by actual return):")
@@ -335,14 +413,42 @@ def track_signals(signal_file: str, max_pairs: int = None):
     # Additional analysis
     print("\n💡 INSIGHTS:")
     
-    # Confidence analysis
-    high_conf = results_df.filter((pl.col("pred_proba") >= 0.85) & ~pl.col("outcome").str.contains("NO_"))
+    # Confidence analysis (for OHLCV signals)
+    if "signal_type" in results_df.columns:
+        ohlcv_df = results_df.filter(pl.col("signal_type") == "OHLCV")
+    else:
+        ohlcv_df = results_df
+    
+    high_conf = ohlcv_df.filter((pl.col("pred_proba") >= 0.85) & ~pl.col("outcome").str.contains("NO_"))
     if len(high_conf) > 0:
         high_conf_wins = len(high_conf.filter(pl.col("outcome").is_in(["WIN", "WIN_ACTIVE"])))
         high_conf_losses = len(high_conf.filter(pl.col("outcome").is_in(["LOSS", "LOSS_ACTIVE"])))
         if high_conf_wins + high_conf_losses > 0:
             high_conf_wr = (high_conf_wins / (high_conf_wins + high_conf_losses) * 100)
-            print(f"   High Confidence (≥85%): {high_conf_wr:.1f}% win rate ({high_conf_wins}W / {high_conf_losses}L)")
+            print(f"   High Confidence OHLCV (≥85%): {high_conf_wr:.1f}% win rate ({high_conf_wins}W / {high_conf_losses}L)")
+    
+    # BB signal analysis
+    if "signal_type" in results_df.columns:
+        bb_df = results_df.filter(pl.col("signal_type") == "BB")
+        if len(bb_df) > 0:
+            bb_completed = bb_df.filter(~pl.col("outcome").str.contains("NO_"))
+            if len(bb_completed) > 0:
+                bb_wins = len(bb_completed.filter(pl.col("outcome").is_in(["WIN", "WIN_ACTIVE"])))
+                bb_losses = len(bb_completed.filter(pl.col("outcome").is_in(["LOSS", "LOSS_ACTIVE"])))
+                if bb_wins + bb_losses > 0:
+                    bb_wr = (bb_wins / (bb_wins + bb_losses) * 100)
+                    print(f"   Bollinger Band Signals: {bb_wr:.1f}% win rate ({bb_wins}W / {bb_losses}L)")
+                
+                # BB position analysis
+                if "bb_position" in bb_completed.columns:
+                    oversold = bb_completed.filter(pl.col("bb_position") < 0.2)
+                    overbought = bb_completed.filter(pl.col("bb_position") > 0.8)
+                    if len(oversold) > 0:
+                        os_wins = len(oversold.filter(pl.col("outcome").is_in(["WIN", "WIN_ACTIVE"])))
+                        os_losses = len(oversold.filter(pl.col("outcome").is_in(["LOSS", "LOSS_ACTIVE"])))
+                        if os_wins + os_losses > 0:
+                            os_wr = (os_wins / (os_wins + os_losses) * 100)
+                            print(f"      Oversold (BB pos < 0.2): {os_wr:.1f}% win rate ({os_wins}W / {os_losses}L)")
     
     # Time analysis
     early_signals = results_df.filter((pl.col("hours_elapsed") < 2) & ~pl.col("outcome").str.contains("NO_"))

@@ -53,6 +53,13 @@ class LiveConfig:
         "volatility_4h", "volatility_24h", "vol_regime_change"
     ]
     
+    # Bollinger Bands signal configuration
+    BB_ENABLED = True  # Enable Bollinger Bands calculation
+    BB_SIGNAL_THRESHOLD_LOWER = 0.0  # Buy signal when price touches lower band (bb_position <= 0.0)
+    BB_SIGNAL_THRESHOLD_UPPER = 1.0  # Sell signal when price touches upper band (bb_position >= 1.0)
+    BB_SQUEEZE_THRESHOLD = 0.02  # BB width < 2% of middle = squeeze (potential breakout)
+    BB_EXPANSION_THRESHOLD = 0.05  # BB width > 5% of middle = expansion (high volatility)
+    
     # Data requirements for features
     MIN_HISTORY_CANDLES = 20  # Need ~20 candles (5 hours at 15min intervals) for features
     UPDATE_INTERVAL_SECONDS = 900  # Generate signals every 15 minutes (matching candle interval)
@@ -65,8 +72,13 @@ class LiveConfig:
     CANDLE_CACHE_PATH = "live_candles_cache.pkl"
     SAVE_INTERVAL_SECONDS = 300  # Save every 5 minutes
     
+    # Trading parameters (for take profit/stop loss)
+    LABEL_UPSIDE_PCT = 2.0  # Target gain (2% for 15-min timeframe)
+    LABEL_DOWNSIDE_PCT = 1.0  # Stop loss (1% for 15-min)
+    LABEL_HORIZON_DAYS = 1  # Holding period (1 day for short-term signals)
+    
     # Base chain pair universe (if available)
-    PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
+    PAIR_UNIVERSE_PATH = "Files/pair-universe"
 
 
 # ============================================================================
@@ -141,6 +153,62 @@ class FeatureEngineer:
         
         return df
     
+    @staticmethod
+    def compute_bollinger_features(df: pl.DataFrame) -> pl.DataFrame:
+        """Compute Bollinger Band-based features"""
+        # Check if BB columns exist
+        bb_cols = ["bb_middle", "bb_upper", "bb_lower", "bb_width", "bb_position"]
+        has_bb = all(col in df.columns for col in bb_cols)
+        
+        if not has_bb:
+            # Return empty BB features if not available
+            return df.with_columns([
+                pl.lit(None).alias("bb_distance_from_middle"),
+                pl.lit(None).alias("bb_distance_from_lower"),
+                pl.lit(None).alias("bb_distance_from_upper"),
+                pl.lit(None).alias("bb_squeeze_signal"),
+                pl.lit(None).alias("bb_expansion_signal"),
+                pl.lit(None).alias("bb_touch_lower"),
+                pl.lit(None).alias("bb_touch_upper"),
+            ])
+        
+        # Distance from middle band (normalized)
+        df = df.with_columns([
+            (100 * (pl.col("close") - pl.col("bb_middle")) / (pl.col("bb_middle") + 1e-9)).alias("bb_distance_from_middle"),
+        ])
+        
+        # Distance from lower band (normalized)
+        df = df.with_columns([
+            (100 * (pl.col("close") - pl.col("bb_lower")) / (pl.col("bb_middle") + 1e-9)).alias("bb_distance_from_lower"),
+        ])
+        
+        # Distance from upper band (normalized)
+        df = df.with_columns([
+            (100 * (pl.col("bb_upper") - pl.col("close")) / (pl.col("bb_middle") + 1e-9)).alias("bb_distance_from_upper"),
+        ])
+        
+        # Squeeze signal (narrow bands = low volatility, potential breakout)
+        df = df.with_columns([
+            ((pl.col("bb_width") < LiveConfig.BB_SQUEEZE_THRESHOLD).cast(pl.Int32)).alias("bb_squeeze_signal")
+        ])
+        
+        # Expansion signal (wide bands = high volatility)
+        df = df.with_columns([
+            ((pl.col("bb_width") > LiveConfig.BB_EXPANSION_THRESHOLD).cast(pl.Int32)).alias("bb_expansion_signal")
+        ])
+        
+        # Touch lower band (oversold signal)
+        df = df.with_columns([
+            ((pl.col("bb_position") <= LiveConfig.BB_SIGNAL_THRESHOLD_LOWER + 0.05).cast(pl.Int32)).alias("bb_touch_lower")
+        ])
+        
+        # Touch upper band (overbought signal)
+        df = df.with_columns([
+            ((pl.col("bb_position") >= LiveConfig.BB_SIGNAL_THRESHOLD_UPPER - 0.05).cast(pl.Int32)).alias("bb_touch_upper")
+        ])
+        
+        return df
+    
     @classmethod
     def compute_all_features(cls, df: pl.DataFrame) -> pl.DataFrame:
         """Compute all features required by the model"""
@@ -163,6 +231,7 @@ class FeatureEngineer:
             .pipe(cls.compute_range_normalized)
             .pipe(cls.compute_flow_features)
             .pipe(cls.compute_volatility)
+            .pipe(cls.compute_bollinger_features)  # Add BB features
         ))
         
         # Fill NaN with 0
@@ -171,12 +240,6 @@ class FeatureEngineer:
                 df = df.with_columns([
                     pl.col(col).fill_nan(0).fill_null(0)
                 ])
-
-        # --- NEW CODE: Save to JSON ---
-        output_file = "features.json"
-        df.write_json(output_file)
-        print(f"Features saved to {output_file}")
-        # ------------------------------
         
         return df
 
@@ -191,7 +254,8 @@ class LiveSignalGenerator:
     def __init__(self, model_path: str = LiveConfig.MODEL_PATH):
         self.model_path = Path(model_path)
         self.model: Optional[xgb.Booster] = None
-        self.streamer = LiveSwapStreamer()
+        # Initialize streamer with Bollinger Bands enabled
+        self.streamer = LiveSwapStreamer(calculate_bollinger_bands=LiveConfig.BB_ENABLED)
         self.candles_history: Dict[str, pl.DataFrame] = {}  # pair_address -> candles
         self.last_signal_time = datetime.now()
         self.last_save_time = time.time()
@@ -362,7 +426,100 @@ class LiveSignalGenerator:
         # Filter to signals only
         signals = result.filter(pl.col("signal") == 1).sort("pred_proba", descending=True)
         
+        # Add signal type and trading parameters
+        if len(signals) > 0:
+            signals = signals.with_columns([
+                pl.lit("OHLCV").alias("signal_type"),
+                pl.lit(LiveConfig.LABEL_UPSIDE_PCT).alias("take_profit_pct"),
+                (pl.col("close") * (1 + LiveConfig.LABEL_UPSIDE_PCT / 100)).alias("take_profit_price"),
+                pl.lit(LiveConfig.LABEL_DOWNSIDE_PCT).alias("stop_loss_pct"),
+                (pl.col("close") * (1 - LiveConfig.LABEL_DOWNSIDE_PCT / 100)).alias("stop_loss_price"),
+                pl.lit(LiveConfig.LABEL_HORIZON_DAYS).alias("holding_period_days"),
+            ])
+        
         return signals
+    
+    def generate_bb_signals(self) -> pl.DataFrame:
+        """Generate Bollinger Band-based trading signals"""
+        
+        # Get all candles
+        all_candles = self.get_all_candles()
+        
+        if len(all_candles) == 0:
+            logger.warning("No candles available for BB signal generation")
+            return pl.DataFrame()
+        
+        # Check if BB data is available
+        bb_cols = ["bb_middle", "bb_upper", "bb_lower", "bb_width", "bb_position"]
+        has_bb = all(col in all_candles.columns for col in bb_cols)
+        
+        if not has_bb:
+            logger.warning("⚠️ Bollinger Bands data not available in candles")
+            return pl.DataFrame()
+        
+        # Filter to candles with valid BB data
+        valid_bb = all_candles.filter(
+            pl.all_horizontal([pl.col(c).is_not_null() for c in bb_cols])
+        )
+        
+        if len(valid_bb) == 0:
+            logger.warning("⚠️ No candles with valid Bollinger Bands data")
+            return pl.DataFrame()
+        
+        # Get latest candle per pair
+        latest_per_pair = valid_bb.group_by("pair_address").agg([
+            pl.all().sort_by("timestamp").last()
+        ])
+        
+        # Generate BB-based signals
+        # Signal 1: Price touches lower band (oversold = buy signal)
+        lower_touch = latest_per_pair.filter(
+            pl.col("bb_position") <= LiveConfig.BB_SIGNAL_THRESHOLD_LOWER + 0.1
+        )
+        
+        # Signal 2: Price touches upper band (overbought = sell signal, but we'll mark as signal)
+        upper_touch = latest_per_pair.filter(
+            pl.col("bb_position") >= LiveConfig.BB_SIGNAL_THRESHOLD_UPPER - 0.1
+        )
+        
+        # Signal 3: BB Squeeze (narrow bands = potential breakout)
+        squeeze = latest_per_pair.filter(
+            pl.col("bb_width") < LiveConfig.BB_SQUEEZE_THRESHOLD
+        )
+        
+        # Combine all BB signals
+        bb_signals = pl.concat([
+            lower_touch.with_columns([pl.lit("bb_lower_touch").alias("bb_signal_reason")]),
+            upper_touch.with_columns([pl.lit("bb_upper_touch").alias("bb_signal_reason")]),
+            squeeze.with_columns([pl.lit("bb_squeeze").alias("bb_signal_reason")]),
+        ]).unique(subset=["pair_address"], keep="first")
+        
+        if len(bb_signals) == 0:
+            return pl.DataFrame()
+        
+        # Calculate signal strength based on BB position
+        # Lower position (closer to 0) = stronger buy signal
+        # Higher position (closer to 1) = stronger sell signal
+        bb_signals = bb_signals.with_columns([
+            # Invert bb_position for buy signals (0 = strongest buy, 1 = strongest sell)
+            (1.0 - pl.col("bb_position")).alias("bb_signal_strength"),
+            # Use bb_signal_strength as pred_proba for compatibility with OHLCV signals
+            (1.0 - pl.col("bb_position")).alias("pred_proba"),
+            pl.lit("BB").alias("signal_type"),
+            pl.lit(LiveConfig.LABEL_UPSIDE_PCT).alias("take_profit_pct"),
+            (pl.col("close") * (1 + LiveConfig.LABEL_UPSIDE_PCT / 100)).alias("take_profit_price"),
+            pl.lit(LiveConfig.LABEL_DOWNSIDE_PCT).alias("stop_loss_pct"),
+            (pl.col("close") * (1 - LiveConfig.LABEL_DOWNSIDE_PCT / 100)).alias("stop_loss_price"),
+            pl.lit(LiveConfig.LABEL_HORIZON_DAYS).alias("holding_period_days"),
+            pl.lit(1).alias("signal"),  # All BB signals are active
+        ])
+        
+        # Sort by signal strength
+        bb_signals = bb_signals.sort("bb_signal_strength", descending=True)
+        
+        logger.info(f"📊 Generated {len(bb_signals)} Bollinger Band signals")
+        
+        return bb_signals
         
     async def run_live(self):
         """Main loop: stream data and generate signals"""
@@ -418,26 +575,59 @@ class LiveSignalGenerator:
                         self._save_cache()
                         self.last_save_time = time.time()
                     
-                # Generate signals
-                signals = self.generate_signals()
+                # Generate OHLCV-based signals (XGBoost model)
+                ohlcv_signals = self.generate_signals()
                 
-                if len(signals) > 0:
+                # Generate Bollinger Band-based signals
+                bb_signals = self.generate_bb_signals()
+                
+                # Combine both signal types
+                all_signals = []
+                if len(ohlcv_signals) > 0:
+                    all_signals.append(ohlcv_signals)
+                if len(bb_signals) > 0:
+                    all_signals.append(bb_signals)
+                
+                if all_signals:
+                    combined_signals = pl.concat(all_signals)
+                    
                     logger.info(f"\n{'='*80}")
-                    logger.info(f"🎯 SIGNALS GENERATED: {len(signals)}")
+                    logger.info(f"🎯 SIGNALS GENERATED: {len(combined_signals)} total")
+                    logger.info(f"   - OHLCV (XGBoost): {len(ohlcv_signals)}")
+                    logger.info(f"   - Bollinger Bands: {len(bb_signals)}")
                     logger.info(f"{'='*80}")
                     
-                    for row in signals.iter_rows(named=True):
-                        logger.info(
-                            f"📊 Pair: {row['pair_address']} | "
-                            f"Confidence: {row['pred_proba']:.3f} | "
-                            f"Price: ${row['close']:.6f} | "
-                            f"Volume: ${row['volume_token1']:.2f}"
-                        )
+                    # Log signals by type
+                    for signal_type in ["OHLCV", "BB"]:
+                        type_signals = combined_signals.filter(pl.col("signal_type") == signal_type)
+                        if len(type_signals) > 0:
+                            logger.info(f"\n📊 {signal_type} Signals ({len(type_signals)}):")
+                            for row in type_signals.head(5).iter_rows(named=True):  # Show top 5
+                                if signal_type == "OHLCV":
+                                    logger.info(
+                                        f"   Pair: {row['pair_address'][:20]}... | "
+                                        f"Confidence: {row.get('pred_proba', 0):.3f} | "
+                                        f"Price: ${row['close']:.6f} | "
+                                        f"TP: ${row.get('take_profit_price', 0):.6f} | "
+                                        f"SL: ${row.get('stop_loss_price', 0):.6f}"
+                                    )
+                                else:  # BB
+                                    reason = row.get('bb_signal_reason', 'unknown')
+                                    strength = row.get('bb_signal_strength', 0)
+                                    logger.info(
+                                        f"   Pair: {row['pair_address'][:20]}... | "
+                                        f"Reason: {reason} | "
+                                        f"Strength: {strength:.3f} | "
+                                        f"BB Position: {row.get('bb_position', 0):.3f} | "
+                                        f"Price: ${row['close']:.6f} | "
+                                        f"TP: ${row.get('take_profit_price', 0):.6f} | "
+                                        f"SL: ${row.get('stop_loss_price', 0):.6f}"
+                                    )
                     
                     # Save signals
-                    self._save_signals(signals)
+                    self._save_signals(combined_signals)
                 else:
-                    logger.info("No signals generated (threshold not met)")
+                    logger.info("No signals generated (thresholds not met)")
                     
                 # Show stats
                 total_pairs = len(self.candles_history)
@@ -460,7 +650,7 @@ class LiveSignalGenerator:
             logger.info("Swap streaming cancelled")
             
     def _save_signals(self, signals: pl.DataFrame):
-        """Save signals to file"""
+        """Save signals to file with signal_type distinction"""
         if len(signals) == 0:
             return
             
@@ -470,6 +660,12 @@ class LiveSignalGenerator:
             signals = signals.with_columns([
                 pl.lit(now.isoformat()).alias("generated_at")
             ])
+            
+            # Ensure signal_type column exists
+            if "signal_type" not in signals.columns:
+                signals = signals.with_columns([
+                    pl.lit("UNKNOWN").alias("signal_type")
+                ])
             
             # Save to timestamped file for comparison
             timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -507,12 +703,38 @@ class LiveSignalGenerator:
                         pl.col(col).cast(pl.Float64) for col in float_cols
                     ])
                 
+                # Align schemas: get all columns from both
+                all_columns = set(existing.columns) | set(signals.columns)
+                
+                # Add missing columns to existing
+                for col in all_columns:
+                    if col not in existing.columns:
+                        existing = existing.with_columns([pl.lit(None).alias(col)])
+                
+                # Add missing columns to signals
+                for col in all_columns:
+                    if col not in signals.columns:
+                        signals = signals.with_columns([pl.lit(None).alias(col)])
+                
+                # Reorder columns to match (alphabetically for consistency)
+                existing = existing.select(sorted(all_columns))
+                signals = signals.select(sorted(all_columns))
+                
+                # Now concatenate with aligned schemas
                 combined = pl.concat([existing, signals])
                 combined.write_csv(output_path)
+                
+                # Log breakdown by signal type
+                ohlcv_count = len(combined.filter(pl.col("signal_type") == "OHLCV"))
+                bb_count = len(combined.filter(pl.col("signal_type") == "BB"))
                 logger.info(f"📊 Appended {len(signals)} signals to {output_path} (total: {len(combined)})")
+                logger.info(f"   Breakdown: {ohlcv_count} OHLCV, {bb_count} BB")
             else:
                 signals.write_csv(output_path)
+                ohlcv_count = len(signals.filter(pl.col("signal_type") == "OHLCV"))
+                bb_count = len(signals.filter(pl.col("signal_type") == "BB"))
                 logger.info(f"📊 Created {output_path} with {len(signals)} signals")
+                logger.info(f"   Breakdown: {ohlcv_count} OHLCV, {bb_count} BB")
             
         except Exception as e:
             logger.error(f"Error saving signals: {e}", exc_info=True)

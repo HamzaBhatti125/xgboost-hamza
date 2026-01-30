@@ -52,6 +52,11 @@ class EnvioConfig:
     CANDLE_INTERVAL_SECONDS = 900  # 15 minutes (matching training data)
     CANDLE_INTERVAL_MINUTES = 15  # 15 minutes (matching training data)
     
+    # Bollinger Bands configuration
+    BB_ENABLED = True  # Enable Bollinger Bands calculation
+    BB_PERIOD = 20  # Number of periods for SMA (default: 20)
+    BB_STD_DEV = 2.0  # Number of standard deviations (default: 2.0)
+    
     # Processing configuration
     BATCH_SIZE = 1000  # Process events in batches
     MAX_BLOCKS_PER_QUERY = 10000  # Hypersync query limit
@@ -116,7 +121,7 @@ class SwapEvent:
     
 @dataclass
 class Candle:
-    """OHLCV candle data"""
+    """OHLCV candle data with Bollinger Bands"""
     pair_address: str
     timestamp: int
     open: float
@@ -126,6 +131,12 @@ class Candle:
     volume_token0: float
     volume_token1: float
     num_trades: int
+    # Bollinger Bands (optional, calculated separately)
+    bb_middle: Optional[float] = None  # SMA
+    bb_upper: Optional[float] = None   # SMA + (2 * std)
+    bb_lower: Optional[float] = None    # SMA - (2 * std)
+    bb_width: Optional[float] = None    # (upper - lower) / middle
+    bb_position: Optional[float] = None # (close - lower) / (upper - lower)
     
 
 # ============================================================================
@@ -390,15 +401,113 @@ class SwapEventProcessor:
 
 
 # ============================================================================
+# BOLLINGER BANDS CALCULATOR
+# ============================================================================
+
+class BollingerBandCalculator:
+    """Calculates Bollinger Bands for candles using rolling window"""
+    
+    def __init__(self, period: int = 20, std_dev: float = 2.0):
+        """
+        Args:
+            period: Number of periods for SMA calculation (default: 20)
+            std_dev: Number of standard deviations for bands (default: 2.0)
+        """
+        self.period = period
+        self.std_dev = std_dev
+        self.candle_history: Dict[str, List[Candle]] = {}  # pair_address -> [candles]
+    
+    def add_candle(self, candle: Candle):
+        """Add candle to history for a pair"""
+        pair = candle.pair_address
+        if pair not in self.candle_history:
+            self.candle_history[pair] = []
+        
+        self.candle_history[pair].append(candle)
+        
+        # Keep only last (period + 1) candles to calculate bands
+        if len(self.candle_history[pair]) > self.period + 1:
+            self.candle_history[pair] = self.candle_history[pair][-self.period - 1:]
+    
+    def calculate_bands(self, candle: Candle) -> Candle:
+        """Calculate Bollinger Bands for a candle using historical data"""
+        pair = candle.pair_address
+        
+        if pair not in self.candle_history or len(self.candle_history[pair]) < self.period:
+            # Not enough history, return candle without bands
+            return candle
+        
+        # Get last 'period' closes (excluding current candle)
+        closes = [c.close for c in self.candle_history[pair][-self.period:]]
+        
+        if len(closes) < self.period:
+            return candle
+        
+        # Calculate SMA (middle band)
+        sma = sum(closes) / len(closes)
+        
+        # Calculate standard deviation
+        variance = sum((c - sma) ** 2 for c in closes) / len(closes)
+        std = variance ** 0.5
+        
+        # Calculate bands
+        upper = sma + (self.std_dev * std)
+        lower = sma - (self.std_dev * std)
+        
+        # Calculate additional metrics
+        band_width = (upper - lower) / sma if sma > 0 else 0.0
+        band_position = (candle.close - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+        
+        # Update candle with Bollinger Band data
+        candle.bb_middle = sma
+        candle.bb_upper = upper
+        candle.bb_lower = lower
+        candle.bb_width = band_width
+        candle.bb_position = band_position
+        
+        return candle
+    
+    def calculate_bands_batch(self, candles: List[Candle]) -> List[Candle]:
+        """Calculate Bollinger Bands for a batch of candles"""
+        result = []
+        
+        # Sort candles by timestamp to ensure correct order
+        sorted_candles = sorted(candles, key=lambda c: c.timestamp)
+        
+        for candle in sorted_candles:
+            # Add to history first
+            self.add_candle(candle)
+            # Calculate bands
+            candle_with_bands = self.calculate_bands(candle)
+            result.append(candle_with_bands)
+        
+        return result
+    
+    def clear_history(self, pair_address: Optional[str] = None):
+        """Clear history for a specific pair or all pairs"""
+        if pair_address:
+            if pair_address in self.candle_history:
+                del self.candle_history[pair_address]
+        else:
+            self.candle_history.clear()
+
+
+# ============================================================================
 # CANDLE AGGREGATOR
 # ============================================================================
 
 class CandleAggregator:
-    """Aggregates swap events into OHLCV candles"""
+    """Aggregates swap events into OHLCV candles with optional Bollinger Bands"""
     
-    def __init__(self, interval_seconds: int = EnvioConfig.CANDLE_INTERVAL_SECONDS):
+    def __init__(self, interval_seconds: int = EnvioConfig.CANDLE_INTERVAL_SECONDS, 
+                 calculate_bollinger_bands: bool = True, bb_period: int = 20, bb_std_dev: float = 2.0):
         self.interval_seconds = interval_seconds
         self.swaps_buffer: Dict[str, List[SwapEvent]] = {}  # pair_address -> [swaps]
+        self.calculate_bollinger_bands = calculate_bollinger_bands
+        if calculate_bollinger_bands:
+            self.bb_calculator = BollingerBandCalculator(period=bb_period, std_dev=bb_std_dev)
+        else:
+            self.bb_calculator = None
         
     def add_swap(self, swap: SwapEvent):
         """Add swap to buffer"""
@@ -474,6 +583,10 @@ class CandleAggregator:
                     num_trades=len(group_swaps)
                 )
                 candles.append(candle)
+        
+        # Calculate Bollinger Bands if enabled
+        if self.calculate_bollinger_bands and self.bb_calculator and candles:
+            candles = self.bb_calculator.calculate_bands_batch(candles)
                 
         return candles
         
@@ -495,10 +608,15 @@ class CandleAggregator:
 class LiveSwapStreamer:
     """Main class for streaming live swap data"""
     
-    def __init__(self, start_block: Optional[int] = None):
+    def __init__(self, start_block: Optional[int] = None, 
+                 calculate_bollinger_bands: bool = EnvioConfig.BB_ENABLED):
         self.client = EnvioHypersyncClient()
         self.processor = SwapEventProcessor()
-        self.aggregator = CandleAggregator()
+        self.aggregator = CandleAggregator(
+            calculate_bollinger_bands=calculate_bollinger_bands,
+            bb_period=EnvioConfig.BB_PERIOD,
+            bb_std_dev=EnvioConfig.BB_STD_DEV
+        )
         self.current_block = start_block
         self.pair_addresses: set = set()  # Track discovered pairs
         
@@ -681,6 +799,13 @@ class LiveSwapStreamer:
             candles = historical_aggregator.generate_candles()
             logger.info(f"✅ Backfill complete: {total_swaps} swaps → {len(candles)} candles")
             
+            # If BB calculator is enabled in main aggregator, calculate BB for historical candles
+            if self.aggregator.bb_calculator and candles:
+                logger.info(f"📊 Calculating Bollinger Bands for {len(candles)} historical candles...")
+                candles = self.aggregator.bb_calculator.calculate_bands_batch(candles)
+                bb_count = sum(1 for c in candles if c.bb_middle is not None)
+                logger.info(f"✅ {bb_count}/{len(candles)} candles now have Bollinger Bands")
+            
             # Convert to DataFrame
             if not candles:
                 return pl.DataFrame()
@@ -697,6 +822,15 @@ class LiveSwapStreamer:
                 "num_trades": [c.num_trades for c in candles],
             }
             
+            # Add Bollinger Bands if available (check if ANY candle has BB data)
+            has_bb_data = any(c.bb_middle is not None for c in candles)
+            if has_bb_data:
+                data["bb_middle"] = [c.bb_middle if c.bb_middle is not None else None for c in candles]
+                data["bb_upper"] = [c.bb_upper if c.bb_upper is not None else None for c in candles]
+                data["bb_lower"] = [c.bb_lower if c.bb_lower is not None else None for c in candles]
+                data["bb_width"] = [c.bb_width if c.bb_width is not None else None for c in candles]
+                data["bb_position"] = [c.bb_position if c.bb_position is not None else None for c in candles]
+            
             return pl.DataFrame(data)
             
         except Exception as e:
@@ -704,9 +838,10 @@ class LiveSwapStreamer:
             return pl.DataFrame()
     
     def get_latest_candles(self) -> pl.DataFrame:
-        """Get latest candles from aggregator"""
+        """Get latest candles from aggregator with Bollinger Bands"""
         candles = self.aggregator.generate_candles()
-        print(f"Generated candles ---> {candles[0]} from swaps")
+        if candles:
+            print(f"Generated {len(candles)} candles with Bollinger Bands")
         
         if not candles:
             return pl.DataFrame()
@@ -723,6 +858,14 @@ class LiveSwapStreamer:
             "volume_token1": [c.volume_token1 for c in candles],
             "num_trades": [c.num_trades for c in candles],
         }
+        
+        # Add Bollinger Bands if available
+        if candles[0].bb_middle is not None:
+            data["bb_middle"] = [c.bb_middle for c in candles]
+            data["bb_upper"] = [c.bb_upper for c in candles]
+            data["bb_lower"] = [c.bb_lower for c in candles]
+            data["bb_width"] = [c.bb_width for c in candles]
+            data["bb_position"] = [c.bb_position for c in candles]
         
         return pl.DataFrame(data)
 
