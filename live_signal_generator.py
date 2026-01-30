@@ -21,6 +21,7 @@ import time
 
 from envio_hypersync import LiveSwapStreamer, EnvioConfig
 from calibrate_model import XGBoostCalibrator
+from position_sizing import PositionSizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +45,14 @@ class LiveConfig:
     # NOTE: Calibration correctly maps predictions to actual probabilities
     # Calibrated 0.32 ≈ Raw 0.73 ≈ ~66-75% actual win rate
     # Multi-batch analysis: 66.8% avg win rate, 75.3% best batch, 8:1 risk-reward
+    
+    # Position sizing configuration
+    USE_POSITION_SIZING = True  # Add Kelly Criterion position sizing to signals
+    KELLY_FRACTION = 0.25  # Quarter-Kelly (25% of full Kelly)
+    MAX_POSITIONS = 10  # Maximum concurrent positions
+    MAX_CAPITAL_DEPLOYED = 0.50  # Maximum 50% of capital deployed
+    MIN_POSITION_SIZE = 0.01  # 1% minimum position
+    MAX_POSITION_SIZE = 0.10  # 10% maximum position
     
     # Feature names (must match training - 15-min candles)
     FEATURE_COLS = [
@@ -361,6 +370,27 @@ class LiveSignalGenerator:
         
         # Filter to signals only
         signals = result.filter(pl.col("signal") == 1).sort("pred_proba", descending=True)
+        
+        # Add position sizing if enabled
+        if LiveConfig.USE_POSITION_SIZING and len(signals) > 0:
+            sizer = PositionSizer(
+                kelly_fraction=LiveConfig.KELLY_FRACTION,
+                min_position_size=LiveConfig.MIN_POSITION_SIZE,
+                max_position_size=LiveConfig.MAX_POSITION_SIZE,
+                max_positions=LiveConfig.MAX_POSITIONS,
+                max_capital_deployed=LiveConfig.MAX_CAPITAL_DEPLOYED,
+            )
+            
+            # Add position sizing columns
+            signals = sizer.add_position_sizes(signals, confidence_col="pred_proba")
+            
+            # Apply portfolio limits and select top signals
+            signals = sizer.apply_portfolio_limits(signals, sort_by="expected_value")
+            
+            # Log selection summary
+            n_selected = signals.filter(pl.col("selected") == True).shape[0]
+            total_capital = signals.filter(pl.col("selected") == True)["adjusted_position_size"].sum()
+            logger.info(f"📊 Position Sizing: {n_selected}/{len(signals)} signals selected, {total_capital:.1%} capital deployed")
         
         return signals
         
