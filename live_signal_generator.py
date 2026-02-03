@@ -21,6 +21,7 @@ import time
 
 from envio_hypersync import LiveSwapStreamer, EnvioConfig
 from calibrate_model import XGBoostCalibrator
+from position_sizing import PositionSizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +45,14 @@ class LiveConfig:
     # NOTE: Calibration correctly maps predictions to actual probabilities
     # Calibrated 0.32 ≈ Raw 0.73 ≈ ~66-75% actual win rate
     # Multi-batch analysis: 66.8% avg win rate, 75.3% best batch, 8:1 risk-reward
+    
+    # Position sizing configuration
+    USE_POSITION_SIZING = True  # Add Kelly Criterion position sizing to signals
+    KELLY_FRACTION = 0.25  # Quarter-Kelly (25% of full Kelly)
+    MAX_POSITIONS = 10  # Maximum concurrent positions
+    MAX_CAPITAL_DEPLOYED = 0.50  # Maximum 50% of capital deployed
+    MIN_POSITION_SIZE = 0.01  # 1% minimum position
+    MAX_POSITION_SIZE = 0.10  # 10% maximum position
     
     # Feature names (must match training - 15-min candles)
     FEATURE_COLS = [
@@ -307,8 +316,14 @@ class LiveSignalGenerator:
         if LiveConfig.USE_CALIBRATION:
             calibrator_path = Path(LiveConfig.CALIBRATOR_PATH)
             if calibrator_path.exists():
-                self.calibrator = XGBoostCalibrator.load(str(calibrator_path))
-                logger.info(f"✓ Loaded calibrator from {calibrator_path}")
+                try:
+                    # Import here to ensure module is available
+                    from calibrate_model import XGBoostCalibrator
+                    self.calibrator = XGBoostCalibrator.load(str(calibrator_path))
+                    logger.info(f"✓ Loaded calibrator from {calibrator_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not load calibrator: {e}, using raw probabilities")
+                    self.calibrator = None
             else:
                 logger.warning(f"⚠️  Calibrator not found at {calibrator_path}, using raw probabilities")
                 self.calibrator = None
@@ -436,6 +451,39 @@ class LiveSignalGenerator:
                 (pl.col("close") * (1 - LiveConfig.LABEL_DOWNSIDE_PCT / 100)).alias("stop_loss_price"),
                 pl.lit(LiveConfig.LABEL_HORIZON_DAYS).alias("holding_period_days"),
             ])
+        # Add position sizing if enabled
+        if LiveConfig.USE_POSITION_SIZING and len(signals) > 0:
+            try:
+                sizer = PositionSizer(
+                    kelly_fraction=LiveConfig.KELLY_FRACTION,
+                    min_position_size=LiveConfig.MIN_POSITION_SIZE,
+                    max_position_size=LiveConfig.MAX_POSITION_SIZE,
+                    max_positions=LiveConfig.MAX_POSITIONS,
+                    max_capital_deployed=LiveConfig.MAX_CAPITAL_DEPLOYED,
+                    win_return=LiveConfig.LABEL_UPSIDE_PCT / 100,  # Convert % to decimal
+                    loss_return=-abs(LiveConfig.LABEL_DOWNSIDE_PCT / 100),  # Convert % to decimal (negative)
+                )
+                
+                # Add position sizing columns
+                signals = sizer.add_position_sizes(signals, confidence_col="pred_proba")
+                
+                # Apply portfolio limits and select top signals
+                signals = sizer.apply_portfolio_limits(signals, sort_by="expected_value")
+                
+                # Log selection summary
+                if "selected" in signals.columns and "adjusted_position_size" in signals.columns:
+                    selected_signals = signals.filter(pl.col("selected") == True)
+                    n_selected = len(selected_signals)
+                    if n_selected > 0:
+                        total_capital = selected_signals["adjusted_position_size"].sum()
+                        logger.info(f"📊 Position Sizing: {n_selected}/{len(signals)} signals selected, {total_capital:.1%} capital deployed")
+                    else:
+                        logger.warning(f"⚠️ Position Sizing: No signals selected after applying portfolio limits")
+                else:
+                    logger.warning(f"⚠️ Position sizing columns not found, skipping selection summary")
+            except Exception as e:
+                logger.error(f"Error applying position sizing: {e}", exc_info=True)
+                # Continue without position sizing if it fails
         
         return signals
     
@@ -589,7 +637,29 @@ class LiveSignalGenerator:
                     all_signals.append(bb_signals)
                 
                 if all_signals:
-                    combined_signals = pl.concat(all_signals)
+                    # Normalize types before concatenating
+                    normalized_signals = []
+                    for sig_df in all_signals:
+                        # Cast all float columns to Float64
+                        float_cols = [col for col, dtype in zip(sig_df.columns, sig_df.dtypes) 
+                                     if dtype in [pl.Float32, pl.Float64]]
+                        if float_cols:
+                            sig_df = sig_df.with_columns([
+                                pl.col(col).cast(pl.Float64) for col in float_cols
+                            ])
+                        
+                        # Cast all int columns to Int64
+                        int_cols = [col for col, dtype in zip(sig_df.columns, sig_df.dtypes) 
+                                   if dtype in [pl.Int32, pl.Int64]]
+                        if int_cols:
+                            sig_df = sig_df.with_columns([
+                                pl.col(col).cast(pl.Int64) for col in int_cols
+                            ])
+                        
+                        normalized_signals.append(sig_df)
+                    
+                    # Use diagonal concat which handles different column schemas
+                    combined_signals = pl.concat(normalized_signals, how='diagonal')
                     
                     logger.info(f"\n{'='*80}")
                     logger.info(f"🎯 SIGNALS GENERATED: {len(combined_signals)} total")

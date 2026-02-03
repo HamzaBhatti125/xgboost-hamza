@@ -184,23 +184,26 @@ def recalibrate_model(
     model_path: str = "xgb_model.json",
     data_path: str = "processed_data.parquet",
     output_path: str = "xgb_calibrator.pkl",
-    validation_split: float = 0.2
+    validation_split: float = 0.2,
+    use_live_cache: bool = True
 ) -> XGBoostCalibrator:
     """
     Main workflow to recalibrate an existing XGBoost model.
     
     Steps:
     1. Load trained model
-    2. Load training data
-    3. Split into train/validation for calibration
-    4. Fit isotonic regression calibrator
-    5. Save calibrator
+    2. Load training data (from live cache or processed_data.parquet)
+    3. Compute features if needed
+    4. Split into train/validation for calibration
+    5. Fit isotonic regression calibrator
+    6. Save calibrator
     
     Args:
         model_path: Path to trained XGBoost model
-        data_path: Path to processed training data
+        data_path: Path to processed training data (if not using live cache)
         output_path: Where to save calibrator
         validation_split: Fraction of data to use for calibration
+        use_live_cache: If True, use live_candles_cache.pkl and compute features
     """
     
     print("\n" + "="*80)
@@ -212,12 +215,7 @@ def recalibrate_model(
     model = xgb.Booster()
     model.load_model(model_path)
     
-    # 2. Load data
-    print(f"📂 Loading data from {data_path}...")
-    df = pl.read_parquet(data_path)
-    print(f"   Loaded {len(df):,} samples")
-    
-    # Define features
+    # Define features (15-minute candles)
     feature_cols = [
         "return_1c", "return_4c", "return_16c",
         "ema_cross_signal", "range_normalized",
@@ -225,13 +223,93 @@ def recalibrate_model(
         "volatility_4h", "volatility_24h", "vol_regime_change"
     ]
     
-    # 3. Split for calibration (use recent data)
+    # 2. Load data
+    if use_live_cache:
+        print(f"📂 Loading data from live_candles_cache.pkl...")
+        import pickle
+        from live_signal_generator import FeatureEngineer, LiveConfig
+        
+        try:
+            with open("live_candles_cache.pkl", "rb") as f:
+                cache = pickle.load(f)
+            
+            # Combine all candles
+            all_candles = []
+            for pair_address, df in cache.items():
+                if not df.is_empty():
+                    df = df.with_columns(pl.lit(pair_address).alias("pair_address"))
+                    all_candles.append(df)
+            
+            if not all_candles:
+                raise ValueError("No candles found in cache!")
+            
+            df = pl.concat(all_candles)
+            print(f"   Loaded {len(df):,} candles from cache")
+            
+            # Compute features
+            print(f"\n🔧 Computing features from candles...")
+            df = FeatureEngineer.compute_all_features(df)
+            
+            # Create proxy labels based on forward returns (similar to barrier-based labeling)
+            # This is a simplified approach - ideally we'd use actual barrier-based labels
+            print(f"\n🔧 Creating proxy labels from forward returns...")
+            df = df.sort(["pair_address", "timestamp"])
+            
+            # Calculate forward return (next 16 candles = 4 hours)
+            df = df.with_columns([
+                (pl.col("close").shift(-16) / pl.col("close") - 1).over("pair_address").alias("fwd_return_16c")
+            ])
+            
+            # Create binary label: 1 if forward return >= target, 0 otherwise
+            # Using 2% target (matching LiveConfig.LABEL_UPSIDE_PCT)
+            target_return = LiveConfig.LABEL_UPSIDE_PCT / 100
+            df = df.with_columns([
+                ((pl.col("fwd_return_16c") >= target_return).cast(pl.Int32)).alias("signal_label")
+            ])
+            
+            # Remove rows without forward returns (last 16 candles per pair)
+            df = df.filter(pl.col("fwd_return_16c").is_not_null())
+            print(f"   Created labels for {len(df):,} samples with forward returns")
+            
+        except FileNotFoundError:
+            print(f"   Cache file not found, using processed_data.parquet instead...")
+            use_live_cache = False
+        except Exception as e:
+            print(f"   Error loading cache: {e}")
+            print(f"   Using processed_data.parquet instead...")
+            use_live_cache = False
+    
+    if not use_live_cache:
+        print(f"📂 Loading data from {data_path}...")
+        df = pl.read_parquet(data_path)
+        print(f"   Loaded {len(df):,} samples")
+        
+        # Check if we have the right features
+        available_cols = set(df.columns)
+        required_cols = set(feature_cols)
+        
+        if not required_cols.issubset(available_cols):
+            missing = required_cols - available_cols
+            print(f"\n❌ Missing required features: {missing}")
+            print(f"   Available columns: {sorted(available_cols)}")
+            print(f"\n   The model expects 15-minute candle features, but data has different features.")
+            print(f"   Please use data with 15-minute candle features or train a new model.")
+            raise ValueError(f"Missing features: {missing}")
+    
+    # 3. Check for signal_label
+    if "signal_label" not in df.columns:
+        print(f"\n⚠️  Warning: No 'signal_label' column found.")
+        print(f"   Cannot perform calibration without labels.")
+        print(f"   You may need to use labeled training data.")
+        raise ValueError("Missing 'signal_label' column - calibration requires labeled data")
+    
+    # 4. Split for calibration (use recent data)
     split_idx = int(len(df) * (1 - validation_split))
     df_cal = df[split_idx:]
     
     print(f"\n✂️  Using last {len(df_cal):,} samples for calibration ({validation_split*100:.0f}%)")
     
-    # 4. Get predictions
+    # 5. Get predictions
     X_cal = df_cal.select(feature_cols).to_numpy()
     y_cal = df_cal["signal_label"].to_numpy()
     
