@@ -18,10 +18,16 @@ import logging
 import json
 import pickle
 import time
+import sys
+import os
 
 from envio_hypersync import LiveSwapStreamer, EnvioConfig
 from calibrate_model import XGBoostCalibrator
 from position_sizing import PositionSizer
+
+# Add market-regime-classifier to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'market-regime-classifier'))
+from market_regime_classifier import MarketRegimeClassifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +79,13 @@ class LiveConfig:
     # Persistence settings
     CANDLE_CACHE_PATH = "live_candles_cache.pkl"
     SAVE_INTERVAL_SECONDS = 300  # Save every 5 minutes
+    
+    # Regime classifier configuration
+    # Model saved in xgboost-hamza folder (absolute path)
+    _base_dir = os.path.dirname(os.path.abspath(__file__))
+    REGIME_MODEL_PATH = os.path.join(_base_dir, "market_regime_model.json")  # Model saved in xgboost-hamza folder
+    REGIME_TRAINING_DATA_PATH = os.path.join(_base_dir, "..", "market-regime-classifier", "candles-1d.parquet")
+    REGIME_TRAIN_SAMPLE_PAIRS = 1000  # Sample pairs for faster training
     
     # Base chain pair universe (if available)
     PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
@@ -206,8 +219,71 @@ class LiveSignalGenerator:
         self.last_save_time = time.time()
         self.cache_path = Path(LiveConfig.CANDLE_CACHE_PATH)
         
+        # Initialize regime classifier - train or load
+        self.regime_model_path = Path(LiveConfig.REGIME_MODEL_PATH)
+        self.regime_classifier = None
+        self._initialize_regime_classifier()
+        
         # Load cached candles on startup
         self._load_cache()
+    
+    def _initialize_regime_classifier(self):
+        """Initialize regime classifier - train if needed, otherwise load
+        
+        The model JSON and metadata will be generated and saved in the xgboost-hamza directory
+        if they don't already exist.
+        """
+        # Check if model exists (both JSON and metadata)
+        model_json_path = Path(self.regime_model_path)
+        model_metadata_path = Path(str(self.regime_model_path).replace(".json", "_metadata.pkl"))
+        
+        if model_json_path.exists() and model_metadata_path.exists():
+            try:
+                # Constructor automatically loads if model_path is provided
+                self.regime_classifier = MarketRegimeClassifier(model_path=str(self.regime_model_path))
+                logger.info(f"✅ Loaded regime classifier from {self.regime_model_path}")
+                return
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to load regime model: {e}. Will retrain.")
+                # Remove corrupted files
+                if model_json_path.exists():
+                    model_json_path.unlink()
+                if model_metadata_path.exists():
+                    model_metadata_path.unlink()
+        
+        # Model doesn't exist or failed to load - train it
+        logger.info("="*80)
+        logger.info("TRAINING MARKET REGIME CLASSIFIER")
+        logger.info(f"Model will be saved to: {self.regime_model_path}")
+        logger.info("="*80)
+        
+        training_data_path = Path(LiveConfig.REGIME_TRAINING_DATA_PATH).resolve()
+        
+        if not training_data_path.exists():
+            logger.warning(f"⚠️  Training data not found at {training_data_path}")
+            logger.warning("⚠️  Regime predictions will be skipped. Please ensure candles-1d.parquet exists.")
+            self.regime_classifier = None
+            return
+        
+        try:
+            # Create classifier and train
+            logger.info(f"📊 Loading training data from {training_data_path}")
+            self.regime_classifier = MarketRegimeClassifier()
+            self.regime_classifier.train(
+                data_path=str(training_data_path),
+                test_size=0.2,
+                sample_pairs=LiveConfig.REGIME_TRAIN_SAMPLE_PAIRS
+            )
+            
+            # Save model (this saves both JSON and metadata pickle)
+            self.regime_classifier.save_model(str(self.regime_model_path))
+            logger.info(f"✅ Regime model trained and saved to {self.regime_model_path}")
+            logger.info(f"✅ Metadata saved to {model_metadata_path}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to train regime classifier: {e}", exc_info=True)
+            logger.warning("⚠️  Regime predictions will be skipped")
+            self.regime_classifier = None
         
     def _load_cache(self):
         """Load cached candles from disk"""
@@ -299,6 +375,71 @@ class LiveSignalGenerator:
             return pl.DataFrame()
             
         return pl.concat([df for df in self.candles_history.values()])
+    
+    def _add_regime_predictions(self, signals: pl.DataFrame) -> pl.DataFrame:
+        """Add regime predictions to signals dataframe"""
+        if self.regime_classifier is None:
+            return signals.with_columns([pl.lit("Unknown").alias("regime")])
+        
+        regime_predictions = []
+        
+        for row in signals.iter_rows(named=True):
+            pair_address = row["pair_address"]
+            
+            # Get candle history for this pair
+            if pair_address not in self.candles_history:
+                regime_predictions.append("Unknown")
+                continue
+            
+            pair_candles = self.candles_history[pair_address]
+            
+            # Convert to format expected by regime classifier
+            # Need: pair_id, timestamp, open, high, low, close, buys, sells, volume, buy_volume, sell_volume, avg
+            try:
+                # Convert 15-min candles to daily-like format for regime prediction
+                # Use recent candles (last 7 days worth = ~672 candles for 15-min intervals)
+                recent_candles = pair_candles.tail(672) if len(pair_candles) > 672 else pair_candles
+                
+                if len(recent_candles) < 7:  # Need minimum history
+                    regime_predictions.append("Unknown")
+                    continue
+                
+                # Convert to regime classifier format
+                regime_df = recent_candles.select([
+                    pl.col("pair_address").alias("pair_id"),
+                    pl.col("timestamp"),
+                    pl.col("open"),
+                    pl.col("high"),
+                    pl.col("low"),
+                    pl.col("close"),
+                    # Estimate buys/sells from num_trades
+                    (pl.col("num_trades") / 2).cast(pl.Int64).alias("buys"),
+                    (pl.col("num_trades") / 2).cast(pl.Int64).alias("sells"),
+                    pl.col("volume_token1").alias("volume"),
+                    (pl.col("volume_token1") * 0.5).alias("buy_volume"),
+                    (pl.col("volume_token1") * 0.5).alias("sell_volume"),
+                    ((pl.col("open") + pl.col("close")) / 2).alias("avg"),
+                    pl.lit(1.0).alias("exchange_rate"),
+                    pl.lit(0).alias("start_block"),
+                    pl.lit(0).alias("end_block"),
+                ])
+                
+                # Predict regime
+                result = self.regime_classifier.predict(regime_df)
+                if len(result) > 0:
+                    regime = result["predicted_regime"].item()
+                    regime_predictions.append(regime)
+                else:
+                    regime_predictions.append("Unknown")
+                    
+            except Exception as e:
+                logger.debug(f"Error predicting regime for {pair_address}: {e}")
+                regime_predictions.append("Unknown")
+        
+        # Add regime column to signals
+        return signals.with_columns([
+            pl.Series("regime", regime_predictions)
+        ])
         
     def generate_signals(self) -> pl.DataFrame:
         """Generate trading signals from current candle data"""
@@ -370,6 +511,10 @@ class LiveSignalGenerator:
         
         # Filter to signals only
         signals = result.filter(pl.col("signal") == 1).sort("pred_proba", descending=True)
+        
+        # Add regime predictions if classifier is available
+        if self.regime_classifier is not None and len(signals) > 0:
+            signals = self._add_regime_predictions(signals)
         
         # Add position sizing if enabled
         if LiveConfig.USE_POSITION_SIZING and len(signals) > 0:
