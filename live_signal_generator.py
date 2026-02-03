@@ -66,6 +66,11 @@ class LiveConfig:
     MIN_HISTORY_CANDLES = 20  # Need ~20 candles (5 hours at 15min intervals) for features
     UPDATE_INTERVAL_SECONDS = 900  # Generate signals every 15 minutes (matching candle interval)
     
+    # Backfill configuration
+    BACKFILL_HOURS = 25  # Hours of historical data to fetch
+    SKIP_BACKFILL_ON_CACHE = True  # Skip backfill if cache exists with sufficient data
+    BACKFILL_TIMEOUT_MINUTES = 15  # Maximum time to wait for backfill
+    
     # Output configuration
     SIGNALS_OUTPUT_PATH = "signals_live.csv"
     HISTORICAL_CANDLES_PATH = "live_candles_history.parquet"
@@ -407,25 +412,41 @@ class LiveSignalGenerator:
         
         # Backfill historical data to populate features properly
         logger.info("\n🔄 Starting historical data backfill...")
-        try:
-            historical_candles = await self.streamer.backfill_historical_candles(hours=25)
+        
+        # Check if we can skip backfill (have cache with sufficient data)
+        ready_pairs = sum(1 for df in self.candles_history.values() if len(df) >= LiveConfig.MIN_HISTORY_CANDLES)
+        if LiveConfig.SKIP_BACKFILL_ON_CACHE and ready_pairs >= 100:
+            logger.info(f"✅ Skipping backfill - cache has {ready_pairs} pairs with sufficient history")
+        else:
+            try:
+                # Run backfill with timeout
+                backfill_timeout = LiveConfig.BACKFILL_TIMEOUT_MINUTES * 60
+                logger.info(f"⏱️  Backfill timeout: {LiveConfig.BACKFILL_TIMEOUT_MINUTES} minutes")
+                
+                historical_candles = await asyncio.wait_for(
+                    self.streamer.backfill_historical_candles(hours=LiveConfig.BACKFILL_HOURS),
+                    timeout=backfill_timeout
+                )
             
-            if len(historical_candles) > 0:
-                logger.info(f"📦 Received {len(historical_candles)} historical candles")
-                self.update_candles_history(historical_candles)
-                
-                # Check readiness after backfill
-                ready_pairs = sum(1 for df in self.candles_history.values() if len(df) >= LiveConfig.MIN_HISTORY_CANDLES)
-                total_candles = sum(len(df) for df in self.candles_history.values())
-                logger.info(f"✅ Backfill complete: {ready_pairs} pairs ready, {total_candles} total candles")
-                
-                # Save the backfilled data
-                self._save_cache()
-            else:
-                logger.warning("⚠️ No historical data retrieved, will accumulate from live stream")
-                
-        except Exception as e:
-            logger.warning(f"⚠️ Backfill failed: {e}. Continuing with live data only...")
+                if len(historical_candles) > 0:
+                    logger.info(f"📦 Received {len(historical_candles)} historical candles")
+                    self.update_candles_history(historical_candles)
+                    
+                    # Check readiness after backfill
+                    ready_pairs = sum(1 for df in self.candles_history.values() if len(df) >= LiveConfig.MIN_HISTORY_CANDLES)
+                    total_candles = sum(len(df) for df in self.candles_history.values())
+                    logger.info(f"✅ Backfill complete: {ready_pairs} pairs ready, {total_candles} total candles")
+                    
+                    # Save the backfilled data
+                    self._save_cache()
+                else:
+                    logger.warning("⚠️ No historical data retrieved, will accumulate from live stream")
+                        
+            except asyncio.TimeoutError:
+                logger.error(f"❌ Backfill timed out after {LiveConfig.BACKFILL_TIMEOUT_MINUTES} minutes")
+                logger.info("⚠️ Continuing with cached data and live stream...")
+            except Exception as e:
+                logger.warning(f"⚠️ Backfill failed: {e}. Continuing with cached data and live stream...")
         
         # Start streaming in background
         stream_task = asyncio.create_task(self._stream_swaps())

@@ -70,7 +70,7 @@ models/embeddings/*
 *.pth
 *.pt
 *.joblib
-*.pkl
+
 *.bin
 *.model
 *.onnx
