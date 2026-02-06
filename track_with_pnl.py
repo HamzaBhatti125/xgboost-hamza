@@ -41,34 +41,44 @@ class PositionTracker:
         signals_df = pl.read_csv(signal_file, try_parse_dates=False)
         print(f"\n📊 Tracking {len(signals_df)} signals from {signal_file}")
         
-        # Check if positioned file exists
-        if position_file is None:
-            position_file = signal_file.replace('.csv', '_positioned.csv')
-        
-        if Path(position_file).exists():
-            positions_df = pl.read_csv(position_file)
-            print(f"✅ Loaded position sizing from {position_file}")
-            
-            # Use positioned file directly if it has all columns
-            if 'position_size_scaled' in positions_df.columns:
-                signals_df = positions_df
-                signals_df = signals_df.with_columns([
-                    (pl.col('position_size_scaled') * 100).alias('position_size_pct')
-                ])
-            else:
-                # Merge with signals
-                signals_df = signals_df.join(
-                    positions_df.select(['pair_address', 'position_size_pct', 'kelly_fraction', 'expected_value']),
-                    on='pair_address',
-                    how='left'
-                )
+        # Check if signal file already has position sizing columns
+        if 'position_size_pct' in signals_df.columns and 'kelly_fraction' in signals_df.columns:
+            print(f"✅ Using position sizing from signal file")
         else:
-            print("⚠️ No position sizing found - using fixed 2% per signal")
-            signals_df = signals_df.with_columns([
-                pl.lit(2.0).alias('position_size_pct'),
-                pl.lit(0.0).alias('kelly_fraction'),
-                pl.lit(0.0).alias('expected_value')
-            ])
+            # Check if positioned file exists
+            if position_file is None:
+                position_file = signal_file.replace('.csv', '_positioned.csv')
+            
+            if Path(position_file).exists():
+                positions_df = pl.read_csv(position_file)
+                print(f"✅ Loaded position sizing from {position_file}")
+                
+                # Use positioned file directly if it has all columns
+                if 'position_size_scaled' in positions_df.columns:
+                    signals_df = positions_df
+                    signals_df = signals_df.with_columns([
+                        (pl.col('position_size_scaled') * 100).alias('position_size_pct')
+                    ])
+                else:
+                    # Merge with signals
+                    signals_df = signals_df.join(
+                        positions_df.select(['pair_address', 'position_size_pct', 'kelly_fraction', 'expected_value']),
+                        on='pair_address',
+                        how='left'
+                    )
+            else:
+                print("⚠️ No position sizing found - using fixed 2% per signal")
+                signals_df = signals_df.with_columns([
+                    pl.lit(2.0).alias('position_size_pct'),
+                    pl.lit(0.0).alias('kelly_fraction'),
+                    pl.lit(0.0).alias('expected_value')
+                ])
+        
+        # Filter to only selected signals
+        if 'selected' in signals_df.columns:
+            before_filter = len(signals_df)
+            signals_df = signals_df.filter(pl.col('selected') == True)
+            print(f"🎯 Filtered to {len(signals_df)} selected signals (from {before_filter} total)")
         
         # Calculate capital per position
         signals_df = signals_df.with_columns([

@@ -13,15 +13,19 @@ import xgboost as xgb
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 import json
 import pickle
 import time
+import subprocess
 
 from envio_hypersync import LiveSwapStreamer, EnvioConfig
 from calibrate_model import XGBoostCalibrator
 from position_sizing import PositionSizer
+from market_regime_detector import MarketRegimeDetector
+from market_regime_detector import MarketRegimeDetector
+from market_regime_detector import MarketRegimeDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +85,37 @@ class LiveConfig:
     
     # Base chain pair universe (if available)
     PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
+    
+    # Market regime integration (OLD SYSTEM - deprecated)
+    USE_REGIME_ANALYSIS = False  # Disabled - using MarketRegimeDetector instead
+    REGIME_FILE_PATH = "market_regime.json"
+    UPDATE_REGIME_EVERY_CYCLE = False  # Disabled - using MarketRegimeDetector instead
+    
+    # Advanced regime detector (HMM + Isolation Forest) - PRIMARY SYSTEM
+    USE_REGIME_DETECTOR = True  # Enable MarketRegimeDetector for position sizing
+    REGIME_DETECTOR_PATH = "regime_detector.pkl"  # Trained detector model
+    REGIME_DETECTOR_MIN_CONFIDENCE = 0.5  # Minimum adjusted confidence after regime scaling
+    
+    # Regime-based adjustments
+    REGIME_KELLY_ADJUSTMENTS = {
+        "panic": 0.0,      # No new positions during panic
+        "bear_volatile": 0.3,  # Minimal exposure
+        "bear_calm": 0.5,      # Reduced exposure
+        "sideways": 1.0,       # Normal operations
+        "bull_calm": 1.0,      # Normal operations
+        "bull_volatile": 0.5,  # Reduce volatility exposure
+        "recovery": 1.25       # Aggressive reentry
+    }
+    
+    REGIME_THRESHOLD_ADJUSTMENTS = {
+        "panic": 0.99,         # Essentially skip trading
+        "bear_volatile": 0.45, # Very selective
+        "bear_calm": 0.38,     # Selective
+        "sideways": 0.32,      # Normal
+        "bull_calm": 0.30,     # Slightly aggressive
+        "bull_volatile": 0.38, # Selective during volatility
+        "recovery": 0.28       # Aggressive reentry
+    }
 
 
 # ============================================================================
@@ -210,6 +245,9 @@ class LiveSignalGenerator:
         self.last_signal_time = datetime.now()
         self.last_save_time = time.time()
         self.cache_path = Path(LiveConfig.CANDLE_CACHE_PATH)
+        self.current_regime = None  # Cache current regime
+        self.regime_detector = None  # MarketRegimeDetector instance
+        self.regime_stats = {'total': 0, 'blocked': 0, 'reduced': 0, 'scalars': []}  # Stats
         
         # Load cached candles on startup
         self._load_cache()
@@ -244,6 +282,68 @@ class LiveSignalGenerator:
         except Exception as e:
             logger.error(f"Failed to save cache: {e}")
     
+    def _update_regime_analysis(self) -> bool:
+        """Run market regime analyzer to update regime file"""
+        if not LiveConfig.UPDATE_REGIME_EVERY_CYCLE:
+            return True  # Skip update, use cached regime
+        
+        try:
+            logger.info("🔍 Updating market regime analysis...")
+            result = subprocess.run(
+                ["python", "market_regime_analyzer.py"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=Path.cwd()
+            )
+            
+            if result.returncode == 0:
+                logger.info("✅ Regime analysis updated successfully")
+                return True
+            else:
+                logger.warning(f"⚠️  Regime analysis failed (exit code {result.returncode})")
+                logger.warning("   Using previously cached regime data")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.warning("⚠️  Regime analysis timed out (30s)")
+            logger.warning("   Using previously cached regime data")
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️  Regime analysis error: {e}")
+            logger.warning("   Using previously cached regime data")
+            return False
+    
+    def _load_regime(self) -> Tuple[Optional[dict], float, float]:
+        """Load market regime and return (regime_data, kelly_adjustment, threshold_adjustment)"""
+        if not LiveConfig.USE_REGIME_ANALYSIS:
+            return None, 1.0, LiveConfig.SIGNAL_THRESHOLD
+        
+        regime_path = Path(LiveConfig.REGIME_FILE_PATH)
+        if not regime_path.exists():
+            logger.warning(f"⚠️  Regime file not found: {regime_path}. Using default parameters.")
+            return None, 1.0, LiveConfig.SIGNAL_THRESHOLD
+        
+        try:
+            with open(regime_path, 'r') as f:
+                regime_data = json.load(f)
+            
+            regime_name = regime_data.get('regime', 'sideways').lower()
+            confidence = regime_data.get('confidence', 0.5)
+            
+            # Get adjustments based on regime
+            kelly_adj = LiveConfig.REGIME_KELLY_ADJUSTMENTS.get(regime_name, 1.0)
+            threshold_adj = LiveConfig.REGIME_THRESHOLD_ADJUSTMENTS.get(regime_name, LiveConfig.SIGNAL_THRESHOLD)
+            
+            # Cache the regime
+            self.current_regime = regime_data
+            
+            return regime_data, kelly_adj, threshold_adj
+            
+        except Exception as e:
+            logger.error(f"Error loading regime: {e}")
+            return None, 1.0, LiveConfig.SIGNAL_THRESHOLD
+    
     def load_model(self):
         """Load trained XGBoost model and calibrator"""
         if not self.model_path.exists():
@@ -266,6 +366,24 @@ class LiveSignalGenerator:
             self.calibrator = None
             logger.info("ℹ️  Calibration disabled, using raw model probabilities")
         
+        # Load regime detector
+        if LiveConfig.USE_REGIME_DETECTOR:
+            detector_path = Path(LiveConfig.REGIME_DETECTOR_PATH)
+            if detector_path.exists():
+                try:
+                    self.regime_detector = MarketRegimeDetector()
+                    self.regime_detector.load(str(detector_path))
+                    logger.info(f"✓ Loaded MarketRegimeDetector from {detector_path}")
+                    logger.info(f"   Crash State: State {self.regime_detector.crash_state_idx}")
+                    logger.info(f"   Min Confidence: {LiveConfig.REGIME_DETECTOR_MIN_CONFIDENCE}")
+                except Exception as e:
+                    logger.error(f"Failed to load regime detector: {e}")
+                    self.regime_detector = None
+            else:
+                logger.warning(f"⚠️  Regime detector not found at {detector_path}")
+                logger.warning("   Run 'python quickstart_regime_detector.py train' to create one")
+                self.regime_detector = None
+        
     def update_candles_history(self, new_candles: pl.DataFrame):
         """Add new candles to historical data"""
         if len(new_candles) == 0:
@@ -277,6 +395,26 @@ class LiveSignalGenerator:
             if pair_address not in self.candles_history:
                 self.candles_history[pair_address] = pair_candles
             else:
+                # Ensure schema compatibility before concat
+                existing_df = self.candles_history[pair_address]
+                
+                # Add missing columns to existing data with default values
+                for col in pair_candles.columns:
+                    if col not in existing_df.columns:
+                        existing_df = existing_df.with_columns([
+                            pl.lit(0.0).alias(col) if pair_candles[col].dtype in [pl.Float64, pl.Float32] else pl.lit(0).alias(col)
+                        ])
+                
+                # Add missing columns to new data (shouldn't happen, but be safe)
+                for col in existing_df.columns:
+                    if col not in pair_candles.columns:
+                        pair_candles = pair_candles.with_columns([
+                            pl.lit(0.0).alias(col) if existing_df[col].dtype in [pl.Float64, pl.Float32] else pl.lit(0).alias(col)
+                        ])
+                
+                # Update the cached dataframe
+                self.candles_history[pair_address] = existing_df
+                
                 # Append and deduplicate by timestamp
                 self.candles_history[pair_address] = (
                     pl.concat([self.candles_history[pair_address], pair_candles])
@@ -304,12 +442,178 @@ class LiveSignalGenerator:
             return pl.DataFrame()
             
         return pl.concat([df for df in self.candles_history.values()])
+    
+    def _apply_regime_detector_filter(self, signals: pl.DataFrame) -> pl.DataFrame:
+        """
+        Apply MarketRegimeDetector filtering to adjust position sizes and block risky trades
+        
+        Args:
+            signals: DataFrame with trading signals
+        
+        Returns:
+            Filtered signals with regime-adjusted confidence
+        """
+        if len(signals) == 0:
+            return signals
+        
+        logger.info("\n" + "="*80)
+        logger.info("🎯 APPLYING ADVANCED REGIME DETECTOR FILTER")
+        logger.info("="*80)
+        
+        regime_results = []
+        
+        for row in signals.iter_rows(named=True):
+            pair_address = row['pair_address']
+            base_confidence = row['pred_proba']
+            
+            self.regime_stats['total'] += 1
+            
+            # Get candle history
+            if pair_address not in self.candles_history:
+                logger.warning(f"⚠️  No candles for {pair_address[:10]}... - blocking")
+                regime_results.append({
+                    'pair_address': pair_address,
+                    'regime_position_scalar': 0.0,
+                    'regime_adjusted_confidence': 0.0,
+                    'regime_state': 2,
+                    'regime_is_emergency': True,
+                    'regime_crash_prob': 1.0
+                })
+                self.regime_stats['blocked'] += 1
+                continue
+            
+            pair_candles = self.candles_history[pair_address]
+            
+            # Need minimum history
+            if len(pair_candles) < 5:
+                logger.debug(f"Insufficient history for {pair_address[:10]}... ({len(pair_candles)} candles)")
+                regime_results.append({
+                    'pair_address': pair_address,
+                    'regime_position_scalar': 0.5,  # Conservative
+                    'regime_adjusted_confidence': base_confidence * 0.5,
+                    'regime_state': 1,
+                    'regime_is_emergency': False,
+                    'regime_crash_prob': 0.5
+                })
+                self.regime_stats['reduced'] += 1
+                self.regime_stats['scalars'].append(0.5)
+                continue
+            
+            # Predict regime
+            try:
+                prediction = self.regime_detector.predict(pair_candles)
+                
+                position_scalar = prediction['position_scalar']
+                is_emergency = prediction['is_emergency']
+                crash_prob = prediction['crash_state_prob']
+                regime_state = prediction['current_regime']
+                
+                # Log warnings
+                if is_emergency:
+                    logger.warning(f"🚨 EMERGENCY: {pair_address[:10]}... - BLOCKING")
+                    self.regime_stats['blocked'] += 1
+                elif crash_prob > 0.7:
+                    logger.warning(f"🔴 CRASH RISK ({crash_prob:.0%}): {pair_address[:10]}... - scalar={position_scalar:.2f}")
+                    self.regime_stats['reduced'] += 1
+                elif position_scalar < 0.8:
+                    logger.info(f"⚠️  REDUCED ({position_scalar:.0%}): {pair_address[:10]}...")
+                    self.regime_stats['reduced'] += 1
+                
+                adjusted_confidence = base_confidence * position_scalar
+                
+                regime_results.append({
+                    'pair_address': pair_address,
+                    'regime_position_scalar': position_scalar,
+                    'regime_adjusted_confidence': adjusted_confidence,
+                    'regime_state': regime_state,
+                    'regime_is_emergency': is_emergency,
+                    'regime_crash_prob': crash_prob
+                })
+                
+                self.regime_stats['scalars'].append(position_scalar)
+            
+            except Exception as e:
+                logger.error(f"❌ Regime prediction error for {pair_address[:10]}...: {e}")
+                regime_results.append({
+                    'pair_address': pair_address,
+                    'regime_position_scalar': 0.0,
+                    'regime_adjusted_confidence': 0.0,
+                    'regime_state': 2,
+                    'regime_is_emergency': True,
+                    'regime_crash_prob': 1.0
+                })
+                self.regime_stats['blocked'] += 1
+        
+        # Join regime data
+        regime_df = pl.DataFrame(regime_results)
+        signals_with_regime = signals.join(regime_df, on='pair_address', how='inner')
+        
+        # Filter out emergencies and low adjusted confidence
+        filtered = signals_with_regime.filter(
+            (~pl.col('regime_is_emergency')) &
+            (pl.col('regime_adjusted_confidence') >= LiveConfig.REGIME_DETECTOR_MIN_CONFIDENCE)
+        )
+        
+        # Log summary
+        n_emergency = signals_with_regime.filter(pl.col('regime_is_emergency')).shape[0]
+        n_low_conf = signals_with_regime.filter(
+            (~pl.col('regime_is_emergency')) &
+            (pl.col('regime_adjusted_confidence') < LiveConfig.REGIME_DETECTOR_MIN_CONFIDENCE)
+        ).shape[0]
+        
+        avg_scalar = sum(self.regime_stats['scalars']) / len(self.regime_stats['scalars']) if self.regime_stats['scalars'] else 0
+        
+        logger.info("")
+        logger.info("📊 REGIME FILTER RESULTS:")
+        logger.info(f"   Input Signals: {len(signals)}")
+        logger.info(f"   🚨 Emergency Blocks: {n_emergency}")
+        logger.info(f"   ⚠️  Low Confidence: {n_low_conf}")
+        logger.info(f"   ✅ Passed Filter: {len(filtered)}")
+        logger.info(f"   📉 Filter Rate: {100*(len(signals)-len(filtered))/len(signals):.1f}%")
+        logger.info(f"   📊 Avg Position Scalar: {avg_scalar:.2f}")
+        logger.info("")
+        logger.info("📈 CUMULATIVE STATS:")
+        logger.info(f"   Total Processed: {self.regime_stats['total']}")
+        logger.info(f"   Blocked: {self.regime_stats['blocked']} ({100*self.regime_stats['blocked']/max(1,self.regime_stats['total']):.1f}%)")
+        logger.info(f"   Reduced: {self.regime_stats['reduced']} ({100*self.regime_stats['reduced']/max(1,self.regime_stats['total']):.1f}%)")
+        logger.info("="*80 + "\n")
+        
+        return filtered
         
     def generate_signals(self) -> pl.DataFrame:
         """Generate trading signals from current candle data"""
         
         if self.model is None:
             self.load_model()
+        
+        # Load market regime and get adjustments
+        regime_data, kelly_adjustment, threshold_adjustment = self._load_regime()
+        
+        # Check for emergency exit
+        if regime_data and regime_data.get('emergency_exit', False):
+            regime_name = regime_data.get('regime', 'unknown').upper()
+            logger.critical(f"🚨 EMERGENCY EXIT TRIGGERED - {regime_name} REGIME DETECTED")
+            logger.critical(f"   Market Drawdown: {regime_data.get('metrics', {}).get('drawdown_pct', 'N/A')}%")
+            logger.critical(f"   Pairs Down: {regime_data.get('metrics', {}).get('pct_pairs_down', 'N/A')}%")
+            logger.critical(f"   ⛔ SKIPPING SIGNAL GENERATION - Close existing positions!")
+            return pl.DataFrame()  # Return empty, no new signals during panic
+        
+        # Log regime status
+        if regime_data:
+            regime_name = regime_data.get('regime', 'unknown').upper()
+            confidence = regime_data.get('confidence', 0)
+            logger.info(f"\n{'='*80}")
+            logger.info(f"📊 MARKET REGIME: {regime_name} (confidence: {confidence:.0%})")
+            logger.info(f"   Kelly Adjustment: {kelly_adjustment}x (base: {LiveConfig.KELLY_FRACTION})")
+            logger.info(f"   Threshold: {threshold_adjustment:.3f} (base: {LiveConfig.SIGNAL_THRESHOLD})")
+            
+            if regime_data.get('reduce_exposure', False):
+                logger.warning(f"   ⚠️  REDUCE EXPOSURE recommended")
+            if regime_data.get('increase_exposure', False):
+                logger.info(f"   ✅ INCREASE EXPOSURE recommended")
+            if regime_data.get('reentry_opportunity', False):
+                logger.info(f"   🎯 REENTRY OPPORTUNITY detected")
+            logger.info(f"{'='*80}\n")
             
         # Get all candles
         all_candles = self.get_all_candles()
@@ -367,19 +671,46 @@ class LiveSignalGenerator:
         above_80 = (pred_proba >= 0.8).sum()
         logger.info(f"📈 Confidence levels: >0.5: {above_50}, >0.7: {above_70}, >0.8: {above_80}")
         
-        # Add predictions to dataframe
+        # Add predictions to dataframe (use regime-adjusted threshold)
         result = latest_per_pair.with_columns([
             pl.Series("pred_proba", pred_proba),
-            pl.Series("signal", (pred_proba >= LiveConfig.SIGNAL_THRESHOLD).astype(int))
+            pl.Series("signal", (pred_proba >= threshold_adjustment).astype(int))
         ])
         
         # Filter to signals only
         signals = result.filter(pl.col("signal") == 1).sort("pred_proba", descending=True)
         
+        # Log threshold effect
+        if regime_data:
+            total_above_base = (pred_proba >= LiveConfig.SIGNAL_THRESHOLD).sum()
+            total_above_adjusted = (pred_proba >= threshold_adjustment).sum()
+            logger.info(f"📊 Threshold adjustment: {total_above_base} signals @ base {LiveConfig.SIGNAL_THRESHOLD:.3f} → {total_above_adjusted} @ adjusted {threshold_adjustment:.3f}")
+        
+        # Filter out low-liquidity/dead pairs (require minimum recent volume)
+        if len(signals) > 0:
+            before_volume_filter = len(signals)
+            # Require at least $100 volume in recent candles to ensure the pair is actively traded
+            signals = signals.filter(
+                (pl.col("volume_token0") > 0) | (pl.col("volume_token1") > 100)
+            )
+            after_volume_filter = len(signals)
+            if after_volume_filter < before_volume_filter:
+                logger.info(f"🔍 Volume filter: removed {before_volume_filter - after_volume_filter} low-liquidity pairs ({after_volume_filter} remaining)")
+        
         # Add position sizing if enabled
         if LiveConfig.USE_POSITION_SIZING and len(signals) > 0:
+            # Apply regime adjustment to Kelly fraction
+            adjusted_kelly = LiveConfig.KELLY_FRACTION * kelly_adjustment
+            
+            # During panic (kelly=0), skip position sizing entirely
+            if adjusted_kelly == 0:
+                logger.warning("⛔ Position sizing skipped - regime disallows new positions")
+                return pl.DataFrame()
+            
+            logger.info(f"📊 Position Sizing: Adjusted Kelly = {adjusted_kelly:.3f} (base: {LiveConfig.KELLY_FRACTION}, adjustment: {kelly_adjustment}x)")
+            
             sizer = PositionSizer(
-                kelly_fraction=LiveConfig.KELLY_FRACTION,
+                kelly_fraction=adjusted_kelly,
                 min_position_size=LiveConfig.MIN_POSITION_SIZE,
                 max_position_size=LiveConfig.MAX_POSITION_SIZE,
                 max_positions=LiveConfig.MAX_POSITIONS,
@@ -396,6 +727,10 @@ class LiveSignalGenerator:
             n_selected = signals.filter(pl.col("selected") == True).shape[0]
             total_capital = signals.filter(pl.col("selected") == True)["adjusted_position_size"].sum()
             logger.info(f"📊 Position Sizing: {n_selected}/{len(signals)} signals selected, {total_capital:.1%} capital deployed")
+        
+        # Apply advanced regime detector filtering
+        if LiveConfig.USE_REGIME_DETECTOR and self.regime_detector is not None and len(signals) > 0:
+            signals = self._apply_regime_detector_filter(signals)
         
         return signals
         
@@ -468,6 +803,9 @@ class LiveSignalGenerator:
                     if time.time() - self.last_save_time > LiveConfig.SAVE_INTERVAL_SECONDS:
                         self._save_cache()
                         self.last_save_time = time.time()
+                
+                # Update regime analysis before generating signals
+                self._update_regime_analysis()
                     
                 # Generate signals
                 signals = self.generate_signals()
@@ -516,11 +854,21 @@ class LiveSignalGenerator:
             return
             
         try:
-            # Add timestamp as string
+            # Add timestamp and regime information
             now = datetime.now()
-            signals = signals.with_columns([
-                pl.lit(now.isoformat()).alias("generated_at")
-            ])
+            regime_cols = [pl.lit(now.isoformat()).alias("generated_at")]
+            
+            # Add regime information if available
+            if self.current_regime:
+                regime_cols.extend([
+                    pl.lit(self.current_regime.get('regime', 'unknown')).alias('market_regime'),
+                    pl.lit(self.current_regime.get('confidence', 0.0)).alias('regime_confidence'),
+                    pl.lit(self.current_regime.get('emergency_exit', False)).alias('emergency_exit'),
+                    pl.lit(self.current_regime.get('reduce_exposure', False)).alias('reduce_exposure'),
+                    pl.lit(self.current_regime.get('increase_exposure', False)).alias('increase_exposure')
+                ])
+            
+            signals = signals.with_columns(regime_cols)
             
             # Save to timestamped file for comparison
             timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")

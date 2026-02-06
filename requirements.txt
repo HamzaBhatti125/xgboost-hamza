@@ -1,4 +1,6 @@
-polars>=0.20.0
+# Core dependencies with tested versions
+# Python 3.12.3 required (pickle protocol 5 support)
+polars==1.37.1
 pyarrow>=14.0.0
 xgboost>=2.0.0
 lightgbm>=4.0.0

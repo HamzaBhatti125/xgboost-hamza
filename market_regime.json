@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-02-05T20:24:53.415198",
+  "regime": "sideways",
+  "confidence": 0.6,
+  "emergency_exit": false,
+  "reduce_exposure": false,
+  "increase_exposure": false,
+  "reentry_opportunity": true,
+  "metrics": {
+    "trend_strength": 0,
+    "volatility_percentile": 0,
+    "drawdown_pct": 0,
+    "volume_surge": 1.0,
+    "pct_pairs_up": 0,
+    "pct_pairs_down": 0
+  }
+}
