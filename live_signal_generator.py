@@ -23,6 +23,7 @@ import os
 from envio_hypersync import LiveSwapStreamer, EnvioConfig
 from calibrate_model import XGBoostCalibrator
 from position_sizing import PositionSizer
+from market_regime_detector import MarketRegimeDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +80,11 @@ class LiveConfig:
     # Persistence settings
     CANDLE_CACHE_PATH = "live_candles_cache.pkl"
     SAVE_INTERVAL_SECONDS = 300  # Save every 5 minutes
+    
+    # Regime detection (HMM + Isolation Forest)
+    USE_REGIME_DETECTOR = True  # Enable crash detection & position scaling
+    REGIME_DETECTOR_PATH = "regime_detector.pkl"  # Trained model
+    REGIME_DETECTOR_MIN_CONFIDENCE = 0.5  # Min adjusted confidence after regime scaling
     
     # Base chain pair universe (if available)
     PAIR_UNIVERSE_PATH = "/home/hamzabhatti18/Desktop/Genesis-labs/backtesting/pair-universe"
@@ -212,6 +218,15 @@ class LiveSignalGenerator:
         self.last_save_time = time.time()
         self.cache_path = Path(LiveConfig.CANDLE_CACHE_PATH)
         
+        # Regime detector for risk management
+        self.regime_detector: Optional[MarketRegimeDetector] = None
+        self.regime_stats = {
+            'total_signals': 0,
+            'emergency_blocks': 0,
+            'position_reduced': 0,
+            'position_scalars': []
+        }
+        
         # Load cached candles on startup
         self._load_cache()
         
@@ -286,6 +301,23 @@ class LiveSignalGenerator:
             self.calibrator = None
             logger.info("ℹ️  Calibration disabled, using raw model probabilities")
         
+        # Load regime detector if enabled
+        if LiveConfig.USE_REGIME_DETECTOR:
+            detector_path = Path(LiveConfig.REGIME_DETECTOR_PATH)
+            if detector_path.exists():
+                try:
+                    self.regime_detector = MarketRegimeDetector()
+                    self.regime_detector.load(str(detector_path))
+                    logger.info(f"✓ Loaded MarketRegimeDetector from {detector_path}")
+                    logger.info(f"   Crash State: State {self.regime_detector.crash_state_idx}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load regime detector: {e}")
+                    self.regime_detector = None
+            else:
+                logger.warning(f"⚠️  Regime detector not found at {detector_path}")
+                self.regime_detector = None
+        
+        
     def update_candles_history(self, new_candles: pl.DataFrame):
         """Add new candles to historical data"""
         if len(new_candles) == 0:
@@ -324,6 +356,133 @@ class LiveSignalGenerator:
             return pl.DataFrame()
             
         return pl.concat([df for df in self.candles_history.values()])
+    
+    def _apply_regime_filter(self, signals: pl.DataFrame) -> pl.DataFrame:
+        """Apply regime-based risk management to signals"""
+        if self.regime_detector is None or len(signals) == 0:
+            return signals
+        
+        logger.info(f"\n🎯 APPLYING ADVANCED REGIME DETECTOR FILTER")
+        logger.info("="*80)
+        
+        # Collect regime predictions for each signal
+        regime_data = []
+        
+        for row in signals.iter_rows(named=True):
+            pair_address = row['pair_address']
+            base_confidence = row.get('pred_proba', 0.0)
+            
+            self.regime_stats['total_signals'] += 1
+            
+            # Get candle history for this pair
+            if pair_address not in self.candles_history:
+                logger.warning(f"⚠️  No candles for {pair_address[:10]}... - blocking")
+                regime_data.append({
+                    'pair_address': pair_address,
+                    'position_scalar': 0.0,
+                    'adjusted_confidence': 0.0,
+                    'regime': 2,
+                    'is_emergency': True
+                })
+                self.regime_stats['emergency_blocks'] += 1
+                continue
+            
+            pair_candles = self.candles_history[pair_address]
+            
+            # Need sufficient history
+            if len(pair_candles) < 5:
+                regime_data.append({
+                    'pair_address': pair_address,
+                    'position_scalar': 0.5,
+                    'adjusted_confidence': base_confidence * 0.5,
+                    'regime': 1,
+                    'is_emergency': False
+                })
+                self.regime_stats['position_reduced'] += 1
+                self.regime_stats['position_scalars'].append(0.5)
+                continue
+            
+            # Predict regime
+            try:
+                prediction = self.regime_detector.predict(pair_candles)
+                
+                position_scalar = prediction['position_scalar']
+                is_emergency = prediction['is_emergency']
+                regime = prediction['current_regime']
+                crash_prob = prediction['crash_state_prob']
+                
+                # Log warnings
+                if is_emergency:
+                    logger.warning(f"🚨 EMERGENCY: {pair_address[:10]}... - BLOCKING")
+                    self.regime_stats['emergency_blocks'] += 1
+                elif crash_prob > 0.5:
+                    logger.warning(f"🔴 CRASH RISK ({crash_prob:.0%}): {pair_address[:10]}... - scalar={position_scalar:.2f}")
+                elif position_scalar < 0.8:
+                    logger.info(f"⚠️  Reduced position ({position_scalar:.0%}): {pair_address[:10]}...")
+                    self.regime_stats['position_reduced'] += 1
+                
+                adjusted_confidence = base_confidence * position_scalar
+                
+                regime_data.append({
+                    'pair_address': pair_address,
+                    'position_scalar': position_scalar,
+                    'adjusted_confidence': adjusted_confidence,
+                    'regime': regime,
+                    'is_emergency': is_emergency
+                })
+                
+                self.regime_stats['position_scalars'].append(position_scalar)
+            
+            except Exception as e:
+                logger.error(f"❌ Regime prediction failed for {pair_address[:10]}...: {e}")
+                regime_data.append({
+                    'pair_address': pair_address,
+                    'position_scalar': 0.0,
+                    'adjusted_confidence': 0.0,
+                    'regime': 2,
+                    'is_emergency': True
+                })
+                self.regime_stats['emergency_blocks'] += 1
+        
+        # Convert to DataFrame and join
+        if not regime_data:
+            return signals
+        
+        regime_df = pl.DataFrame(regime_data)
+        signals_with_regime = signals.join(regime_df, on='pair_address', how='inner')
+        
+        # Filter by regime
+        filtered_signals = signals_with_regime.filter(
+            (~pl.col('is_emergency')) &
+            (pl.col('adjusted_confidence') >= LiveConfig.REGIME_DETECTOR_MIN_CONFIDENCE)
+        )
+        
+        # Log summary
+        n_total = len(signals)
+        n_emergency = signals_with_regime.filter(pl.col('is_emergency')).shape[0]
+        n_low_conf = signals_with_regime.filter(
+            (~pl.col('is_emergency')) & (pl.col('adjusted_confidence') < LiveConfig.REGIME_DETECTOR_MIN_CONFIDENCE)
+        ).shape[0]
+        n_passed = len(filtered_signals)
+        
+        logger.info(f"\n📊 REGIME FILTER RESULTS:")
+        logger.info(f"   Input Signals: {n_total}")
+        logger.info(f"   🚨 Emergency Blocks: {n_emergency}")
+        logger.info(f"   ⚠️  Low Confidence: {n_low_conf}")
+        logger.info(f"   ✅ Passed Filter: {n_passed}")
+        logger.info(f"   📉 Filter Rate: {100*(n_total-n_passed)/n_total:.1f}%")
+        
+        if self.regime_stats['position_scalars']:
+            avg_scalar = np.mean(self.regime_stats['position_scalars'])
+            logger.info(f"   📊 Avg Position Scalar: {avg_scalar:.2f}")
+        
+        logger.info("\n📈 CUMULATIVE STATS:")
+        logger.info(f"   Total Processed: {self.regime_stats['total_signals']}")
+        logger.info(f"   Blocked: {self.regime_stats['emergency_blocks']} ({100*self.regime_stats['emergency_blocks']/max(1, self.regime_stats['total_signals']):.1f}%)")
+        logger.info(f"   Reduced: {self.regime_stats['position_reduced']} ({100*self.regime_stats['position_reduced']/max(1, self.regime_stats['total_signals']):.1f}%)")
+        logger.info("="*80)
+        
+        return filtered_signals
         
     def generate_signals(self) -> pl.DataFrame:
         """Generate trading signals from current candle data"""
@@ -416,6 +575,10 @@ class LiveSignalGenerator:
             n_selected = signals.filter(pl.col("selected") == True).shape[0]
             total_capital = signals.filter(pl.col("selected") == True)["adjusted_position_size"].sum()
             logger.info(f"📊 Position Sizing: {n_selected}/{len(signals)} signals selected, {total_capital:.1%} capital deployed")
+        
+        # Apply regime-based risk management if enabled
+        if LiveConfig.USE_REGIME_DETECTOR and len(signals) > 0:
+            signals = self._apply_regime_filter(signals)
         
         return signals
         

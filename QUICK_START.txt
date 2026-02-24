@@ -1,0 +1,157 @@
+# ⚡ QUICK START CARD
+
+## RUN IN 3 LINES:
+```bash
+source .venv/bin/activate
+cd /home/faizan/work/xgboost-hamza
+python live_signal_generator.py
+```
+
+That's it! ✅
+
+---
+
+## WHAT YOU GET:
+
+Every 15 minutes:
+- **signals_YYYY-MM-DD_HH-MM-SS.csv** ← Trading signals with regime data
+- **Live streaming** of market data
+- **Regime detection** blocking dangerous trades
+- **Position sizing** on remaining signals
+
+---
+
+## STOP IT:
+Press `Ctrl+C` - Cache saves automatically ✅
+
+---
+
+## COLUMNS IN OUTPUT CSV:
+
+```
+pair_address          = Token address
+pred_proba            = Model confidence (0-1)
+position_scalar       = Risk adjustment (0-1)  ⭐ REGIME
+adjusted_confidence   = pred_proba × scalar    ⭐ REGIME
+regime                = HMM state (0/1/2)      ⭐ REGIME
+is_emergency          = Anomaly detected?      ⭐ REGIME
+selected              = Portfolio filter pass?
+adjusted_position_size = Final size %
+```
+
+**⭐ = NEW with regime detection**
+
+---
+
+## THE REGIME FILTER:
+
+**Crash Detected?** → position_scalar = 0.0 → Signal Blocked ✗
+**Normal Market?** → position_scalar = 1.0 → Signal Passes ✓
+**Mixed/Transition?** → position_scalar = 0.5 → Half Size ⚠️
+
+---
+
+## REQUIRED FILES:
+
+- ✅ xgb_model.json (XGBoost model)
+- ✅ xgb_calibrator.pkl (Probability calibration)
+- ✅ regime_detector.pkl (Crash detection) ⭐ NEW
+- ✅ live_signal_generator.py (Main script - already integrated)
+
+---
+
+## IF SOMETHING BREAKS:
+
+**Cache corrupted?**
+```bash
+rm live_candles_cache.pkl
+python live_signal_generator.py  # Rebuild automatically
+```
+
+**Models missing?**
+```bash
+# Train them first:
+python model_training.py
+python calibrate_model.py
+python quickstart_regime_detector.py train
+```
+
+---
+
+## KEY FEATURES:
+
+✅ Real-time market streaming
+✅ XGBoost predictions with calibration
+✅ **Regime-based risk management** ⭐
+✅ Automatic position sizing (Kelly Criterion)
+✅ Atomic cache writes (no corruption)
+✅ Emergency exit detection (anomaly-based)
+✅ Logging every 15 minutes
+
+---
+
+## WHAT'S NEW (This Session):
+
+🆕 **Regime Detector Integration** - Now filtering all signals!
+🆕 **Position Scaling** - Crashes = lower positions automatically
+🆕 **Emergency Detection** - Isolation Forest catches anomalies
+🆕 **Atomic Cache Writes** - No corruption on Ctrl+C
+🆕 **Comprehensive Logging** - See regime stats every cycle
+
+---
+
+## CONFIG (live_signal_generator.py):
+
+To disable regime (if needed):
+```python
+USE_REGIME_DETECTOR = False
+```
+
+To adjust sensitivity:
+```python
+REGIME_DETECTOR_MIN_CONFIDENCE = 0.5  # 0.3=loose, 0.7=strict
+```
+
+---
+
+## MONITOR:
+
+Look for in logs:
+- ✅ "Loaded MarketRegimeDetector" = Good to go
+- 🔴 "CRASH RISK" = Positions being reduced
+- 🚨 "EMERGENCY" = Anomaly detected, signal blocked
+- 📊 "REGIME FILTER RESULTS" = Summary stats
+
+---
+
+## TYPICAL OUTPUT (Every 15 min):
+
+```
+✅ Computing predictions for 192 valid rows
+📊 Calibration: raw mean=0.069 → calibrated mean=0.073
+📊 Position Sizing: 10/192 signals selected
+
+🎯 APPLYING ADVANCED REGIME DETECTOR FILTER
+📊 REGIME FILTER RESULTS:
+   Input Signals: 10
+   🚨 Emergency Blocks: 0
+   ⚠️ Low Confidence: 2
+   ✅ Passed Filter: 8
+   📉 Filter Rate: 20.0%
+   📊 Avg Position Scalar: 0.85
+```
+
+---
+
+## NEXT STEPS:
+
+1. Run it: `python live_signal_generator.py`
+2. Wait 5 minutes (warmup/backfill)
+3. Check first signals in CSV after 15 minutes
+4. Monitor regime statistics in logs
+5. Adjust config if needed
+
+---
+
+**Questions?** Check `RUN_INSTRUCTIONS.md` for detailed guide
+**Deep dive?** See `REGIME_INTEGRATION_FLOW.md` for architecture
