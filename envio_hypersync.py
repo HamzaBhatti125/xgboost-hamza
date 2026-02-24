@@ -45,7 +45,6 @@ class EnvioConfig:
     # Event signatures
     SWAP_V2_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"  # Swap(address,uint256,uint256,uint256,uint256,address)
     SWAP_V3_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"  # Swap(address,address,int256,int256,uint160,uint128,int24)
-    SYNC_V2_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"  # Sync(uint112,uint112)
     PAIR_CREATED_V2_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"  # PairCreated
     POOL_CREATED_V3_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"  # PoolCreated
     
@@ -113,7 +112,6 @@ class SwapEvent:
     price: float  # token1/token0
     volume_usd: float  # USD volume for weighting (using token1 as proxy)
     is_v3: bool
-    liquidity: float  # Pool liquidity at time of swap
     
     
 @dataclass
@@ -128,8 +126,6 @@ class Candle:
     volume_token0: float
     volume_token1: float
     num_trades: int
-    avg_liquidity: float  # Average liquidity during candle period
-    vwap: float  # Volume-weighted average price
     
 
 # ============================================================================
@@ -264,7 +260,6 @@ class SwapEventProcessor:
     
     def __init__(self, pair_universe_path: str = "./Files/pair-universe"):
         self.pair_info: Dict[str, Dict] = {}  # Cache pair info
-        self.liquidity_cache: Dict[str, float] = {}  # Cache V2 pair liquidity from Sync events
         self._load_pair_universe(pair_universe_path)
     
     def _load_pair_universe(self, path: str):
@@ -296,32 +291,6 @@ class SwapEventProcessor:
         # Default to 18 if not found
         logger.debug(f"Pair {pair_address} not found in universe, using default 18 decimals")
         return (18, 18)
-    
-    def decode_v2_sync(self, log: Dict) -> None:
-        """Decode Uniswap V2 Sync event and update liquidity cache"""
-        try:
-            # Decode log data: Sync(uint112 reserve0, uint112 reserve1)
-            data = bytes.fromhex(log["data"][2:] if log["data"].startswith("0x") else log["data"])
-            
-            # Extract reserves (2 uint112 values, but stored as uint256 in data)
-            reserve0 = int.from_bytes(data[0:32], byteorder='big')
-            reserve1 = int.from_bytes(data[32:64], byteorder='big')
-            
-            # Get decimals for proper calculation
-            token0_decimals, token1_decimals = self._get_decimals(log["address"])
-            
-            # Calculate geometric mean liquidity: sqrt(reserve0 * reserve1)
-            # Apply decimals for proper units
-            reserve0_adj = reserve0 / (10 ** token0_decimals)
-            reserve1_adj = reserve1 / (10 ** token1_decimals)
-            
-            liquidity = (reserve0_adj * reserve1_adj) ** 0.5
-            
-            # Cache liquidity for this pair
-            self.liquidity_cache[log["address"].lower()] = liquidity
-            
-        except Exception as e:
-            logger.error(f"Error decoding V2 Sync: {e}")
         
     def decode_v2_swap(self, log: Dict) -> Optional[SwapEvent]:
         """Decode Uniswap V2 swap event"""
@@ -350,9 +319,6 @@ class SwapEventProcessor:
             
             # Calculate volume (use token1 as proxy for USD value)
             volume_usd = abs(amount1)
-            
-            # Get liquidity from cache (default to 0 if not available)
-            liquidity = self.liquidity_cache.get(log["address"].lower(), 0.0)
                 
             return SwapEvent(
                 block_number=log["block_number"],
@@ -366,8 +332,7 @@ class SwapEventProcessor:
                 amount1=amount1,
                 price=price,
                 volume_usd=volume_usd,
-                is_v3=False,
-                liquidity=liquidity
+                is_v3=False
             )
             
         except Exception as e:
@@ -383,16 +348,10 @@ class SwapEventProcessor:
             # Decode amounts (int256, int256, uint160, uint128, int24)
             amount0_bytes = data[0:32]
             amount1_bytes = data[32:64]
-            # sqrtPriceX96 at data[64:96]
-            liquidity_bytes = data[96:128]
-            # tick at data[128:160]
             
             # Convert from int256 (signed)
             amount0_raw = int.from_bytes(amount0_bytes, byteorder='big', signed=True)
             amount1_raw = int.from_bytes(amount1_bytes, byteorder='big', signed=True)
-            
-            # Extract liquidity (uint128)
-            liquidity_raw = int.from_bytes(liquidity_bytes, byteorder='big')
             
             # Get correct decimals for this pair
             token0_decimals, token1_decimals = self._get_decimals(log["address"])
@@ -400,10 +359,6 @@ class SwapEventProcessor:
             # Convert amounts using correct decimals
             amount0 = float(amount0_raw) / (10 ** token0_decimals)
             amount1 = float(amount1_raw) / (10 ** token1_decimals)
-            
-            # Convert liquidity to human-readable format (geometric mean)
-            # V3 liquidity is in sqrt(token0 * token1) units
-            liquidity = float(liquidity_raw) / (10 ** ((token0_decimals + token1_decimals) / 2))
             
             # Calculate price
             if amount0 != 0:
@@ -426,8 +381,7 @@ class SwapEventProcessor:
                 amount1=amount1,
                 price=price,
                 volume_usd=volume_usd,
-                is_v3=True,
-                liquidity=liquidity
+                is_v3=True
             )
             
         except Exception as e:
@@ -504,13 +458,9 @@ class CandleAggregator:
                 prices = [p for p, _, _ in valid_swaps]
                 volumes = [v for _, v, _ in valid_swaps]
                 
-                # Calculate volume-weighted average price (VWAP)
+                # Calculate volume-weighted average price (VWAP) for reference
                 total_volume = sum(volumes)
                 vwap = sum(p * v for p, v in zip(prices, volumes)) / total_volume if total_volume > 0 else prices[-1]
-                
-                # Calculate average liquidity
-                liquidities = [s.liquidity for s in group_swaps if s.liquidity > 0]
-                avg_liquidity = sum(liquidities) / len(liquidities) if liquidities else 0.0
                 
                 candle = Candle(
                     pair_address=pair_address,
@@ -518,12 +468,10 @@ class CandleAggregator:
                     open=prices[0],      # First trade price
                     high=max(prices),    # Highest trade price
                     low=min(prices),     # Lowest trade price  
-                    close=prices[-1],    # Last trade price
+                    close=prices[-1],    # Last trade price (volume-weighted would be vwap)
                     volume_token0=sum(abs(s.amount0) for s in group_swaps),
                     volume_token1=sum(abs(s.amount1) for s in group_swaps),
-                    num_trades=len(group_swaps),
-                    avg_liquidity=avg_liquidity,
-                    vwap=vwap
+                    num_trades=len(group_swaps)
                 )
                 candles.append(candle)
                 
@@ -632,17 +580,6 @@ class LiveSwapStreamer:
                         
                     logger.info(f"Processing blocks {self.current_block} to {latest_block}")
                     
-                    # Query Sync events first (for V2 liquidity)
-                    sync_logs = await self.client.query_logs(
-                        from_block=self.current_block,
-                        to_block=min(latest_block, self.current_block + EnvioConfig.MAX_BLOCKS_PER_QUERY),
-                        topics=[EnvioConfig.SYNC_V2_TOPIC]
-                    )
-                    
-                    # Process Sync events to update liquidity cache
-                    for log in sync_logs:
-                        self.processor.decode_v2_sync(log)
-                    
                     # Query swap events (both V2 and V3)
                     v2_logs = await self.client.query_logs(
                         from_block=self.current_block,
@@ -710,17 +647,6 @@ class LiveSwapStreamer:
             for chunk_start in range(from_block, to_block, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, to_block)
                 
-                # Query Sync events first (for V2 liquidity)
-                sync_logs = await self.client.query_logs(
-                    from_block=chunk_start,
-                    to_block=chunk_end,
-                    topics=[EnvioConfig.SYNC_V2_TOPIC]
-                )
-                
-                # Process Sync events to update liquidity cache
-                for log in sync_logs:
-                    self.processor.decode_v2_sync(log)
-                
                 # Query V2 and V3 swap events using existing method
                 v2_logs = await self.client.query_logs(
                     from_block=chunk_start,
@@ -769,8 +695,6 @@ class LiveSwapStreamer:
                 "volume_token0": [c.volume_token0 for c in candles],
                 "volume_token1": [c.volume_token1 for c in candles],
                 "num_trades": [c.num_trades for c in candles],
-                "avg_liquidity": [c.avg_liquidity for c in candles],
-                "vwap": [c.vwap for c in candles],
             }
             
             return pl.DataFrame(data)
@@ -798,58 +722,9 @@ class LiveSwapStreamer:
             "volume_token0": [c.volume_token0 for c in candles],
             "volume_token1": [c.volume_token1 for c in candles],
             "num_trades": [c.num_trades for c in candles],
-            "avg_liquidity": [c.avg_liquidity for c in candles],
-            "vwap": [c.vwap for c in candles],
         }
         
         return pl.DataFrame(data)
-
-
-# ============================================================================
-# FEATURE ENGINEERING
-# ============================================================================
-
-def calculate_regime_features(df: pl.DataFrame) -> pl.DataFrame:
-    """Calculate market regime features from candle data
-    
-    Args:
-        df: Polars DataFrame with columns: pair_address, timestamp, close, volume_token1, avg_liquidity, vwap
-        
-    Returns:
-        DataFrame with added regime features: amihud_illiquidity, liquidity_change
-    """
-    if len(df) == 0:
-        return df
-    
-    # Sort by pair and timestamp to ensure proper ordering
-    df = df.sort(["pair_address", "timestamp"])
-    
-    # Calculate log returns
-    df = df.with_columns([
-        (pl.col("close") / pl.col("close").shift(1).over("pair_address")).log().alias("log_return")
-    ])
-    
-    # Calculate Amihud Illiquidity: |log_return| / volume_usd
-    # Using volume_token1 as proxy for volume_usd
-    df = df.with_columns([
-        (pl.col("log_return").abs() / pl.col("volume_token1").clip(lower_bound=1e-10)).alias("amihud_illiquidity")
-    ])
-    
-    # Calculate Liquidity Change: % change from previous candle
-    df = df.with_columns([
-        ((pl.col("avg_liquidity") - pl.col("avg_liquidity").shift(1).over("pair_address")) / 
-         pl.col("avg_liquidity").shift(1).over("pair_address").clip(lower_bound=1e-10)
-        ).alias("liquidity_change")
-    ])
-    
-    # Fill nulls (first candle in each pair will have null for changes)
-    df = df.with_columns([
-        pl.col("log_return").fill_null(0.0),
-        pl.col("amihud_illiquidity").fill_null(0.0),
-        pl.col("liquidity_change").fill_null(0.0),
-    ])
-    
-    return df
 
 
 # ============================================================================

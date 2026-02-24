@@ -72,10 +72,32 @@ class MarketRegimeAnalyzer:
         }
         
     def load_cache(self) -> Dict:
-        """Load candle cache"""
-        with open(self.cache_file, 'rb') as f:
-            self.cache = pickle.load(f)
-        return self.cache
+        """Load candle cache with corruption recovery"""
+        try:
+            with open(self.cache_file, 'rb') as f:
+                self.cache = pickle.load(f)
+            return self.cache
+        except (EOFError, pickle.UnpicklingError) as e:
+            # Cache is corrupted, try backup
+            backup_file = self.cache_file + '.backup'
+            if Path(backup_file).exists():
+                logger.warning(f"⚠️  Cache corrupted, loading from backup...")
+                try:
+                    with open(backup_file, 'rb') as f:
+                        self.cache = pickle.load(f)
+                    # Restore the corrupted file
+                    import shutil
+                    shutil.copy(backup_file, self.cache_file)
+                    logger.info(f"✅ Cache restored from backup")
+                    return self.cache
+                except Exception as backup_err:
+                    logger.error(f"❌ Backup also corrupted: {backup_err}")
+            
+            # No backup or backup failed
+            raise RuntimeError(
+                f"Cache file is corrupted and no valid backup found.\n"
+                f"Please delete {self.cache_file} and run the live signal generator to rebuild the cache."
+            )
     
     def analyze_market(self) -> RegimeSignals:
         """Main analysis function - returns current market regime and signals"""

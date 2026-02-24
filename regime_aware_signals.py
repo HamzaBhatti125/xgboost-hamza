@@ -143,7 +143,7 @@ class RegimeAwareSignalGenerator:
                     logger.warning(f"🚨 EMERGENCY for {pair_address[:10]}... - BLOCKING")
                     self.regime_stats['emergency_blocks'] += 1
                 elif crash_prob > 0.5:
-                    logger.warning(f"🔴 HIGH CRASH RISK ({crash_prob:.0%}) for {pair_address[:10]}...")
+                    logger.warning(f"🔴 HIGH CRASH RISK ({crash_prob:.0%}) for {pair_address}")
                 elif position_scalar < 0.8:
                     logger.info(f"⚠️ Reduced position ({position_scalar:.0%}) for {pair_address[:10]}...")
                     self.regime_stats['position_reduced'] += 1
